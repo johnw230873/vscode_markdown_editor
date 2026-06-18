@@ -570,14 +570,24 @@ document.getElementById('taskListBtn')!.addEventListener('click', () => {
   execCmd('insertHTML', html);
 });
 
+// Mark / Highlight
+document.getElementById('markBtn')!.addEventListener('click', () => {
+  const sel = window.getSelection();
+  const content = sel && sel.toString() ? escapeHtml(sel.toString()) : 'highlighted text';
+  execCmd('insertHTML', `<mark>${content}</mark>`);
+});
+
 // Link button
+let editingLinkElement: HTMLAnchorElement | null = null;
 document.getElementById('linkBtn')!.addEventListener('click', () => {
+  editingLinkElement = null;
   const modal = document.getElementById('linkModal')!;
   const sel = window.getSelection();
   const selectedText = sel ? sel.toString() : '';
   (document.getElementById('linkText') as HTMLInputElement).value = selectedText;
   (document.getElementById('linkUrl') as HTMLInputElement).value = '';
   (document.getElementById('linkTitle') as HTMLInputElement).value = '';
+  (document.getElementById('linkNewTab') as HTMLInputElement).checked = false;
   modal.style.display = 'flex';
   (document.getElementById('linkUrl') as HTMLInputElement).focus();
 });
@@ -589,11 +599,22 @@ document.getElementById('linkInsertOk')!.addEventListener('click', () => {
   const newTab = (document.getElementById('linkNewTab') as HTMLInputElement).checked;
 
   if (url) {
-    let html = `<a href="${escapeHtml(url)}"`;
-    if (title) html += ` title="${escapeHtml(title)}"`;
-    if (newTab) html += ` target="_blank"`;
-    html += `>${escapeHtml(text)}</a>`;
-    execCmd('insertHTML', html);
+    if (editingLinkElement) {
+      editingLinkElement.href = url;
+      editingLinkElement.textContent = text;
+      editingLinkElement.title = title;
+      if (newTab) editingLinkElement.setAttribute('target', '_blank');
+      else editingLinkElement.removeAttribute('target');
+      editingLinkElement = null;
+      hasUserEdited = true;
+      scheduleSync();
+    } else {
+      let html = `<a href="${escapeHtml(url)}"`;
+      if (title) html += ` title="${escapeHtml(title)}"`;
+      if (newTab) html += ` target="_blank"`;
+      html += `>${escapeHtml(text)}</a>`;
+      execCmd('insertHTML', html);
+    }
   }
   document.getElementById('linkModal')!.style.display = 'none';
 });
@@ -618,12 +639,33 @@ document.getElementById('inlineCodeBtn')!.addEventListener('click', () => {
 });
 
 // Code block
+let savedCodeRange: Range | null = null;
 document.getElementById('codeBlockBtn')!.addEventListener('click', () => {
-  const lang = (document.getElementById('codeLanguageSelect') as HTMLSelectElement).value;
   const sel = window.getSelection();
-  const code = sel ? sel.toString() : 'code here';
+  if (sel && sel.rangeCount > 0) savedCodeRange = sel.getRangeAt(0).cloneRange();
+  (document.getElementById('codeLanguageSelect') as HTMLSelectElement).value = '';
+  document.getElementById('codeBlockModal')!.style.display = 'flex';
+});
+
+document.getElementById('codeBlockInsertOk')!.addEventListener('click', () => {
+  const lang = (document.getElementById('codeLanguageSelect') as HTMLSelectElement).value;
   const langAttr = lang ? ` class="language-${lang}"` : '';
-  execCmd('insertHTML', `<pre><code${langAttr}>${escapeHtml(code)}</code></pre><p><br></p>`);
+  document.getElementById('codeBlockModal')!.style.display = 'none';
+  editor.focus();
+  if (savedCodeRange) {
+    const s = window.getSelection();
+    if (s) { s.removeAllRanges(); s.addRange(savedCodeRange); }
+    savedCodeRange = null;
+  }
+  const selectedText = window.getSelection()?.toString() || 'code here';
+  document.execCommand('insertHTML', false, `<pre><code${langAttr}>${escapeHtml(selectedText)}</code></pre><p><br></p>`);
+  hasUserEdited = true;
+  scheduleSync();
+});
+
+document.getElementById('codeBlockInsertCancel')!.addEventListener('click', () => {
+  document.getElementById('codeBlockModal')!.style.display = 'none';
+  savedCodeRange = null;
 });
 
 // Blockquote
@@ -699,15 +741,85 @@ document.getElementById('tableInsertCancel')!.addEventListener('click', () => {
   savedTableRange = null;
 });
 
+// ── Source position sync: find the char offset in markdown that matches the WYSIWYG cursor ──
+function getSourceCharOffsetForCursor(md: string): number {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return 0;
+  const range = sel.getRangeAt(0);
+  if (!editor.contains(range.startContainer)) return 0;
+
+  const mdLines = md.split('\n');
+
+  // Walk up from the cursor node to find the nearest block-level element
+  const BLOCK_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BLOCKQUOTE', 'PRE', 'DIV', 'TD', 'TH', 'HR']);
+  let blockEl: Element | null = null;
+  let cur: Node | null = range.startContainer;
+  while (cur && cur !== editor) {
+    if (cur.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has((cur as Element).tagName)) {
+      blockEl = cur as Element;
+      break;
+    }
+    cur = cur.parentNode;
+  }
+
+  let targetLine = 0;
+  let matched = false;
+
+  if (blockEl) {
+    // Strip markdown-syntax characters from each line and look for a line whose
+    // plain text matches the start of the block element's text content.
+    const needle = (blockEl.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (needle.length >= 3) {
+      for (let i = 0; i < mdLines.length; i++) {
+        const stripped = mdLines[i]
+          .replace(/^[#\s\-*+>`|[\]!]+/, '')  // strip leading syntax
+          .trim()
+          .replace(/\s+/g, ' ');
+        if (stripped.length >= 3 && needle.startsWith(stripped.slice(0, Math.min(stripped.length, 30)))) {
+          targetLine = i;
+          matched = true;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!matched) {
+    // Proportional fallback: use ratio of plain-text position to total plain text
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let textBefore = '';
+    let node: Node | null;
+    while ((node = walker.nextNode())) {
+      if (node === range.startContainer) {
+        textBefore += (node.textContent ?? '').slice(0, range.startOffset);
+        break;
+      }
+      textBefore += node.textContent ?? '';
+    }
+    const total = editor.innerText || '';
+    if (total.length > 0) {
+      targetLine = Math.floor((textBefore.length / total.length) * mdLines.length);
+    }
+  }
+
+  const clamped = Math.max(0, Math.min(targetLine, mdLines.length - 1));
+  // Convert line number to character offset in the markdown string
+  return mdLines.slice(0, clamped).join('\n').length + (clamped > 0 ? 1 : 0);
+}
+
 // Toggle source view
 const editorWrapper = document.getElementById('editorWrapper')!;
 document.getElementById('toggleSourceBtn')!.addEventListener('click', () => {
   isSourceView = !isSourceView;
+  document.getElementById('toggleSourceBtn')!.classList.toggle('active', isSourceView);
   if (isSourceView) {
-    sourceEditor.value = htmlToMarkdown(editor.innerHTML);
+    const md = htmlToMarkdown(editor.innerHTML);
+    const charOffset = getSourceCharOffsetForCursor(md);
+    sourceEditor.value = md;
     editorWrapper.style.display = 'none';
     sourceContainer.style.display = 'flex';
     sourceEditor.focus();
+    sourceEditor.setSelectionRange(charOffset, charOffset);
   } else {
     const md = sourceEditor.value;
     editor.innerHTML = markdownToHtml(md);
@@ -1104,7 +1216,7 @@ function showSpellContextMenu(word: string, suggestions: string[]) {
   menu.appendChild(divider2);
 
   // Standard options
-  [{ label: 'Cut', cmd: 'cut' }, { label: 'Copy', cmd: 'copy' }, { label: 'Paste', cmd: 'paste' }].forEach(({ label, cmd }) => {
+  [{ label: 'Cut', cmd: 'cut' }, { label: 'Copy', cmd: 'copy' }].forEach(({ label, cmd }) => {
     const item = document.createElement('button');
     item.className = 'context-menu-item';
     item.textContent = label;
@@ -1139,8 +1251,9 @@ function replaceWord(replacement: string) {
 editor.addEventListener('contextmenu', (e: MouseEvent) => {
   removeContextMenu();
 
-  // Check if right-clicked on an image
   const target = e.target as HTMLElement;
+
+  // Image
   if (target.tagName === 'IMG') {
     e.preventDefault();
     e.stopPropagation();
@@ -1148,13 +1261,31 @@ editor.addEventListener('contextmenu', (e: MouseEvent) => {
     return;
   }
 
+  // Link
+  const anchor = target.closest('a');
+  if (anchor && editor.contains(anchor)) {
+    e.preventDefault();
+    e.stopPropagation();
+    showLinkContextMenu(anchor as HTMLAnchorElement, e.clientX, e.clientY);
+    return;
+  }
+
+  // Table cell
+  const tableCell = target.closest<HTMLTableCellElement>('td, th');
+  if (tableCell && editor.contains(tableCell)) {
+    e.preventDefault();
+    e.stopPropagation();
+    showTableContextMenu(tableCell, e.clientX, e.clientY);
+    return;
+  }
+
+  // Spell check
   const wordInfo = getWordAtPoint(e.clientX, e.clientY);
   if (wordInfo && currentMisspelled.has(wordInfo.word.toLowerCase())) {
     e.preventDefault();
     e.stopPropagation();
     contextMenuTarget = wordInfo;
     pendingContextMenuPos = { x: e.clientX, y: e.clientY };
-    // Get suggestions directly (no round-trip)
     const suggestions = getSuggestions(wordInfo.word);
     showSpellContextMenu(wordInfo.word, suggestions);
   }
@@ -1219,6 +1350,171 @@ function showImageContextMenu(img: HTMLImageElement, x: number, y: number) {
   }
 }
 
+// ── Link Context Menu ──
+function showLinkContextMenu(anchor: HTMLAnchorElement, x: number, y: number) {
+  const menu = document.createElement('div');
+  menu.id = 'spellContextMenu';
+  menu.className = 'context-menu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+
+  const editItem = document.createElement('button');
+  editItem.className = 'context-menu-item';
+  editItem.textContent = 'Edit Link';
+  editItem.addEventListener('click', () => {
+    editingLinkElement = anchor;
+    (document.getElementById('linkUrl') as HTMLInputElement).value = anchor.getAttribute('href') || '';
+    (document.getElementById('linkText') as HTMLInputElement).value = anchor.textContent || '';
+    (document.getElementById('linkTitle') as HTMLInputElement).value = anchor.title || '';
+    (document.getElementById('linkNewTab') as HTMLInputElement).checked = anchor.target === '_blank';
+    document.getElementById('linkModal')!.style.display = 'flex';
+    (document.getElementById('linkUrl') as HTMLInputElement).focus();
+    removeContextMenu();
+  });
+  menu.appendChild(editItem);
+
+  const copyItem = document.createElement('button');
+  copyItem.className = 'context-menu-item';
+  copyItem.textContent = 'Copy Link URL';
+  copyItem.addEventListener('click', () => {
+    navigator.clipboard.writeText(anchor.getAttribute('href') || '').catch(() => {});
+    removeContextMenu();
+  });
+  menu.appendChild(copyItem);
+
+  const linkDivider = document.createElement('div');
+  linkDivider.className = 'context-menu-divider';
+  menu.appendChild(linkDivider);
+
+  const removeItem = document.createElement('button');
+  removeItem.className = 'context-menu-item';
+  removeItem.textContent = 'Remove Link';
+  removeItem.addEventListener('click', () => {
+    const text = document.createTextNode(anchor.textContent || '');
+    anchor.parentNode?.replaceChild(text, anchor);
+    hasUserEdited = true;
+    scheduleSync();
+    removeContextMenu();
+  });
+  menu.appendChild(removeItem);
+
+  document.body.appendChild(menu);
+  const lr = menu.getBoundingClientRect();
+  if (lr.right > window.innerWidth) menu.style.left = (window.innerWidth - lr.width - 5) + 'px';
+  if (lr.bottom > window.innerHeight) menu.style.top = (window.innerHeight - lr.height - 5) + 'px';
+}
+
+// ── Table Context Menu ──
+function showTableContextMenu(cell: HTMLTableCellElement, x: number, y: number) {
+  const row = cell.parentElement as HTMLTableRowElement;
+  const table = cell.closest('table') as HTMLTableElement;
+  if (!table) return;
+  const colIndex = Array.from(row.cells).indexOf(cell);
+
+  const menu = document.createElement('div');
+  menu.id = 'spellContextMenu';
+  menu.className = 'context-menu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+
+  const tableActions: Array<{ label: string; fn: () => void }> = [
+    {
+      label: 'Add Row Above',
+      fn: () => {
+        const newRow = row.cloneNode(true) as HTMLTableRowElement;
+        Array.from(newRow.cells).forEach(c => { c.innerHTML = '&nbsp;'; });
+        row.parentNode!.insertBefore(newRow, row);
+      },
+    },
+    {
+      label: 'Add Row Below',
+      fn: () => {
+        const newRow = row.cloneNode(true) as HTMLTableRowElement;
+        Array.from(newRow.cells).forEach(c => { c.innerHTML = '&nbsp;'; });
+        row.parentNode!.insertBefore(newRow, row.nextSibling);
+      },
+    },
+    {
+      label: 'Add Column Left',
+      fn: () => {
+        Array.from(table.rows).forEach(r => {
+          const ref = r.cells[colIndex];
+          if (ref) {
+            const newCell = document.createElement(ref.tagName.toLowerCase());
+            newCell.innerHTML = '&nbsp;';
+            ref.parentNode!.insertBefore(newCell, ref);
+          }
+        });
+      },
+    },
+    {
+      label: 'Add Column Right',
+      fn: () => {
+        Array.from(table.rows).forEach(r => {
+          const ref = r.cells[colIndex];
+          if (ref) {
+            const newCell = document.createElement(ref.tagName.toLowerCase());
+            newCell.innerHTML = '&nbsp;';
+            ref.parentNode!.insertBefore(newCell, ref.nextSibling);
+          }
+        });
+      },
+    },
+  ];
+
+  tableActions.forEach(({ label, fn }) => {
+    const item = document.createElement('button');
+    item.className = 'context-menu-item';
+    item.textContent = label;
+    item.addEventListener('click', () => { fn(); hasUserEdited = true; scheduleSync(); removeContextMenu(); });
+    menu.appendChild(item);
+  });
+
+  const td1 = document.createElement('div');
+  td1.className = 'context-menu-divider';
+  menu.appendChild(td1);
+
+  const delRow = document.createElement('button');
+  delRow.className = 'context-menu-item';
+  delRow.textContent = 'Delete Row';
+  delRow.addEventListener('click', () => {
+    if (table.rows.length > 1) row.remove(); else table.remove();
+    hasUserEdited = true; scheduleSync(); removeContextMenu();
+  });
+  menu.appendChild(delRow);
+
+  const delCol = document.createElement('button');
+  delCol.className = 'context-menu-item';
+  delCol.textContent = 'Delete Column';
+  delCol.addEventListener('click', () => {
+    if (row.cells.length > 1) {
+      Array.from(table.rows).forEach(r => { if (r.cells[colIndex]) r.deleteCell(colIndex); });
+    } else {
+      table.remove();
+    }
+    hasUserEdited = true; scheduleSync(); removeContextMenu();
+  });
+  menu.appendChild(delCol);
+
+  const td2 = document.createElement('div');
+  td2.className = 'context-menu-divider';
+  menu.appendChild(td2);
+
+  const delTable = document.createElement('button');
+  delTable.className = 'context-menu-item';
+  delTable.textContent = 'Delete Table';
+  delTable.addEventListener('click', () => {
+    table.remove();
+    hasUserEdited = true; scheduleSync(); removeContextMenu();
+  });
+  menu.appendChild(delTable);
+
+  document.body.appendChild(menu);
+  const tr = menu.getBoundingClientRect();
+  if (tr.right > window.innerWidth) menu.style.left = (window.innerWidth - tr.width - 5) + 'px';
+  if (tr.bottom > window.innerHeight) menu.style.top = (window.innerHeight - tr.height - 5) + 'px';
+}
+
 // Close context menu on click elsewhere
 document.addEventListener('click', (e) => {
   const menu = document.getElementById('spellContextMenu');
@@ -1231,6 +1527,82 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     removeContextMenu();
   }
+});
+
+// ── Cursor position tracking ──
+document.addEventListener('selectionchange', () => {
+  if (isSourceView) return;
+  const cursorEl = document.getElementById('cursorPosition');
+  if (!cursorEl) return;
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) { cursorEl.textContent = ''; return; }
+  const range = sel.getRangeAt(0);
+  if (!editor.contains(range.startContainer)) { cursorEl.textContent = ''; return; }
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+  let text = '';
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    if (node === range.startContainer) { text += (node.textContent ?? '').slice(0, range.startOffset); break; }
+    text += node.textContent ?? '';
+  }
+  const lines = text.split('\n');
+  cursorEl.textContent = `Ln ${lines.length}, Col ${lines[lines.length - 1].length + 1}`;
+});
+
+// ── Image hover tooltip ──
+const imgTooltip = document.createElement('div');
+imgTooltip.id = 'imgTooltip';
+imgTooltip.className = 'img-tooltip';
+document.body.appendChild(imgTooltip);
+
+let imgTooltipTimer: ReturnType<typeof setTimeout> | null = null;
+let tooltipImg: HTMLImageElement | null = null;
+
+function showImgTooltip(img: HTMLImageElement, x: number, y: number) {
+  const relativePath = getImageRelativePath(img);
+  const filename = relativePath.replace(/\\/g, '/').split('/').pop() || relativePath;
+  imgTooltip.textContent = filename;
+  imgTooltip.style.display = 'block';
+  // Position below-right of cursor, keeping within viewport
+  const offset = 14;
+  imgTooltip.style.left = (x + offset) + 'px';
+  imgTooltip.style.top = (y + offset) + 'px';
+  requestAnimationFrame(() => {
+    const rect = imgTooltip.getBoundingClientRect();
+    if (rect.right > window.innerWidth - 8) {
+      imgTooltip.style.left = (x - rect.width - offset) + 'px';
+    }
+    if (rect.bottom > window.innerHeight - 8) {
+      imgTooltip.style.top = (y - rect.height - offset) + 'px';
+    }
+  });
+}
+
+function hideImgTooltip() {
+  imgTooltip.style.display = 'none';
+  if (imgTooltipTimer) { clearTimeout(imgTooltipTimer); imgTooltipTimer = null; }
+  tooltipImg = null;
+}
+
+editor.addEventListener('mousemove', (e: MouseEvent) => {
+  const target = e.target as HTMLElement;
+  if (target.tagName === 'IMG') {
+    const img = target as HTMLImageElement;
+    if (tooltipImg !== img) {
+      hideImgTooltip();
+      tooltipImg = img;
+    }
+    if (imgTooltipTimer) clearTimeout(imgTooltipTimer);
+    const cx = e.clientX;
+    const cy = e.clientY;
+    imgTooltipTimer = setTimeout(() => showImgTooltip(img, cx, cy), 700);
+  } else {
+    if (tooltipImg) hideImgTooltip();
+  }
+});
+
+editor.addEventListener('mouseleave', () => {
+  hideImgTooltip();
 });
 
 // ── Notify extension we're ready ──

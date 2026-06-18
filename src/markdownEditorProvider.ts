@@ -348,6 +348,11 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         <button class="toolbar-btn" data-command="justifyRight" title="Align Right">&#x2262;</button>
         <button class="toolbar-btn" data-command="justifyFull" title="Justify">&#x2630;</button>
       </div>
+      <div class="toolbar-separator"></div>
+      <div class="toolbar-group">
+        <button class="toolbar-btn" id="markBtn" title="Highlight (Mark)"><mark>A</mark></button>
+        <button class="toolbar-btn" data-command="removeFormat" title="Clear Formatting">&#x2718; Clear</button>
+      </div>
     </div>
     <!-- Row 2: Insert & Structure -->
     <div class="toolbar-row">
@@ -369,47 +374,13 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       <div class="toolbar-separator"></div>
       <div class="toolbar-group">
         <button class="toolbar-btn" id="inlineCodeBtn" title="Inline Code">&lt;/&gt;</button>
-        <button class="toolbar-btn" id="codeBlockBtn" title="Code Block">&#x2338; Code</button>
-        <select id="codeLanguageSelect" title="Code Language">
-          <option value="">Language</option>
-          <option value="javascript">JavaScript</option>
-          <option value="typescript">TypeScript</option>
-          <option value="python">Python</option>
-          <option value="csharp">C#</option>
-          <option value="java">Java</option>
-          <option value="html">HTML</option>
-          <option value="css">CSS</option>
-          <option value="json">JSON</option>
-          <option value="yaml">YAML</option>
-          <option value="bash">Bash</option>
-          <option value="sql">SQL</option>
-          <option value="xml">XML</option>
-          <option value="markdown">Markdown</option>
-          <option value="powershell">PowerShell</option>
-          <option value="terraform">Terraform</option>
-        </select>
+        <button class="toolbar-btn" id="codeBlockBtn" title="Insert Code Block">&#x2338; Code</button>
       </div>
       <div class="toolbar-separator"></div>
       <div class="toolbar-group">
         <button class="toolbar-btn" id="blockquoteBtn" title="Blockquote">&#x275D;</button>
         <button class="toolbar-btn" id="hrBtn" title="Horizontal Rule">&#x2015;</button>
         <button class="toolbar-btn" id="tableBtn" title="Insert Table">&#x25A6; Table</button>
-      </div>
-      <div class="toolbar-separator"></div>
-      <div class="toolbar-group">
-        <button class="toolbar-btn" data-command="removeFormat" title="Clear Formatting">&#x2718; Clear</button>
-      </div>
-      <div class="toolbar-separator"></div>
-      <div class="toolbar-group">
-        <button class="toolbar-btn" id="toggleSourceBtn" title="Toggle Source View">&#x2328; Source</button>
-        <button class="toolbar-btn" id="toggleNavBtn" title="Toggle Navigation Pane">&#x2630; Outline</button>
-        <button class="toolbar-btn" id="togglePageModeBtn" title="Toggle Page/Full Width">&#x1F4C4; Page</button>
-      </div>
-      <div class="toolbar-separator"></div>
-      <div class="toolbar-group zoom-group">
-        <label class="zoom-label" for="zoomSlider">&#x1F50D;</label>
-        <input type="range" id="zoomSlider" min="50" max="200" value="100" step="10" title="Zoom">
-        <span id="zoomValue">100%</span>
       </div>
     </div>
   </div>
@@ -433,7 +404,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
   <!-- Link modal -->
   <div id="linkModal" class="modal" style="display:none;">
     <div class="modal-content">
-      <h3>Insert Link</h3>
+      <h3>Link</h3>
       <div class="modal-body">
         <label>URL: <input type="url" id="linkUrl" placeholder="https://example.com"></label>
         <label>Text: <input type="text" id="linkText" placeholder="Link text"></label>
@@ -441,8 +412,41 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         <label>Open in new tab: <input type="checkbox" id="linkNewTab"></label>
       </div>
       <div class="modal-actions">
-        <button id="linkInsertOk" class="modal-btn primary">Insert</button>
+        <button id="linkInsertOk" class="modal-btn primary">OK</button>
         <button id="linkInsertCancel" class="modal-btn">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Code block modal -->
+  <div id="codeBlockModal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <h3>Insert Code Block</h3>
+      <div class="modal-body">
+        <label>Language:
+          <select id="codeLanguageSelect">
+            <option value="">None</option>
+            <option value="javascript">JavaScript</option>
+            <option value="typescript">TypeScript</option>
+            <option value="python">Python</option>
+            <option value="csharp">C#</option>
+            <option value="java">Java</option>
+            <option value="html">HTML</option>
+            <option value="css">CSS</option>
+            <option value="json">JSON</option>
+            <option value="yaml">YAML</option>
+            <option value="bash">Bash</option>
+            <option value="sql">SQL</option>
+            <option value="xml">XML</option>
+            <option value="markdown">Markdown</option>
+            <option value="powershell">PowerShell</option>
+            <option value="terraform">Terraform</option>
+          </select>
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button id="codeBlockInsertOk" class="modal-btn primary">Insert</button>
+        <button id="codeBlockInsertCancel" class="modal-btn">Cancel</button>
       </div>
     </div>
   </div>
@@ -468,6 +472,14 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     <span id="wordCount">Words: 0</span>
     <span id="charCount">Characters: 0</span>
     <span id="cursorPosition"></span>
+    <span class="status-spacer"></span>
+    <button class="status-btn" id="toggleSourceBtn" title="Toggle Source View">&#x2328; Source</button>
+    <button class="status-btn" id="toggleNavBtn" title="Toggle Outline">&#x2630; Outline</button>
+    <button class="status-btn" id="togglePageModeBtn" title="Toggle Page Mode">&#x1F4C4; Page</button>
+    <span class="status-separator"></span>
+    <label class="zoom-label" for="zoomSlider">&#x1F50D;</label>
+    <input type="range" id="zoomSlider" min="50" max="200" value="100" step="10" title="Zoom">
+    <span id="zoomValue">100%</span>
   </div>
 
   <script nonce="${nonce}">

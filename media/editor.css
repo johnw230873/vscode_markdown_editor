@@ -1,5 +1,26 @@
 /* ── Visual Markdown Editor Styles ── */
 
+/* ── Image hover tooltip ── */
+.img-tooltip {
+  display: none;
+  position: fixed;
+  z-index: 9999;
+  background: var(--vscode-editorHoverWidget-background, #252526);
+  color: var(--vscode-editorHoverWidget-foreground, #cccccc);
+  border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: var(--vscode-editor-font-family, 'Consolas', 'Courier New', monospace);
+  pointer-events: none;
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  opacity: 0.95;
+}
+
 :root {
   --toolbar-bg: var(--vscode-editor-background, #1e1e1e);
   --toolbar-border: var(--vscode-panel-border, #444);
@@ -798,6 +819,64 @@ body {
 #editorContainer::-webkit-scrollbar-track,
 #sourceEditor::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ── Status Bar Controls ── */
+.status-spacer {
+  flex: 1;
+}
+
+.status-separator {
+  width: 1px;
+  height: 14px;
+  background: rgba(255, 255, 255, 0.3);
+  margin: 0 6px;
+  flex-shrink: 0;
+}
+
+.status-btn {
+  background: transparent;
+  border: none;
+  color: var(--status-fg);
+  padding: 0 8px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 2px;
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+.status-btn:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.status-btn.active {
+  opacity: 1;
+  font-weight: 600;
+}
+
+#statusBar .zoom-label {
+  font-size: 11px;
+  cursor: default;
+  color: var(--status-fg);
+  opacity: 0.8;
+}
+
+#statusBar #zoomSlider {
+  width: 60px;
+  height: 3px;
+  cursor: pointer;
+  accent-color: var(--status-fg);
+}
+
+#statusBar #zoomValue {
+  font-size: 11px;
+  min-width: 32px;
+  text-align: center;
+  color: var(--status-fg);
+  opacity: 0.8;
 }
 
 /* ── Print styles ── */
