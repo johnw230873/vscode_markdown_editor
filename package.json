@@ -1,0 +1,72 @@
+{
+  "name": "visual-markdown-editor",
+  "displayName": "Visual Markdown Editor",
+  "description": "A feature-rich WYSIWYG markdown editor for VS Code with image management, formatting, colors, and tables",
+  "version": "0.1.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "visualMarkdownEditor.editor",
+        "displayName": "Visual Markdown Editor",
+        "selector": [
+          {
+            "filenamePattern": "*.md"
+          },
+          {
+            "filenamePattern": "*.markdown"
+          },
+          {
+            "filenamePattern": "*.mdown"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "visualMarkdownEditor.openVisualEditor",
+        "title": "Open with Visual Markdown Editor"
+      },
+      {
+        "command": "visualMarkdownEditor.newDocument",
+        "title": "Visual Markdown: New Document"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "visualMarkdownEditor.openVisualEditor",
+          "when": "resourceExtname == .md || resourceExtname == .markdown",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/turndown": "^5.0.4",
+    "@types/vscode": "^1.80.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "an-array-of-english-words": "^2.0.0",
+    "marked": "^12.0.0",
+    "turndown": "^7.1.3",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}

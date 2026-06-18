@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output (esbuild generates dist/)
+dist/
+
+# VS Code extension package
+*.vsix
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code local settings (keep .vscode/launch.json and .vscode/extensions.json if present)
+.vscode/settings.json
+.vscode/.ropeproject
+
+# Environment files
+.env
+.env.local
+
+# Test coverage
+coverage/
