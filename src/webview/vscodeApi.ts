@@ -17,7 +17,13 @@ export type VsCodeMessage =
   | { type: 'deleteImage'; relativePath: string }
   | { type: 'addCustomWord'; word: string }
   | { type: 'showInfo'; text: string }
-  | { type: 'toggleTextEditor' };
+  | { type: 'toggleTextEditor' }
+  | {
+      type: 'toggleTextEditor';
+      markdown: string;
+      startOffset: number;
+      endOffset: number;
+    };
 
 export function postMessage(message: VsCodeMessage): void {
   vscode.postMessage(message);

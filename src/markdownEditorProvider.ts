@@ -110,7 +110,22 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         case 'toggleTextEditor': {
           // User clicked the "Text Editor" button inside the webview.
           // Delegate to the registered command so we have one code path.
-          vscode.commands.executeCommand('visualMarkdownEditor.toggleTextEditor', document.uri);
+          //
+          // If the webview also sent selection offsets (because the user had
+          // a non-collapsed selection), pass them through so the text editor
+          // can auto-select the equivalent range after opening.
+          const offsets = (typeof message.startOffset === 'number' && typeof message.endOffset === 'number')
+            ? {
+                markdown: message.markdown as string,
+                startOffset: message.startOffset as number,
+                endOffset: message.endOffset as number,
+              }
+            : undefined;
+          vscode.commands.executeCommand(
+            'visualMarkdownEditor.toggleTextEditor',
+            document.uri,
+            offsets,
+          );
           return;
         }
       }

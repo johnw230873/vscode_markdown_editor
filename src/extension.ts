@@ -65,11 +65,20 @@ export function activate(context: vscode.ExtensionContext) {
    * Swapping to a real Text Editor — in the same tab, no split — restores all
    * of those features. Press Ctrl+Alt+V (or click "Text Editor" in the status
    * bar) to flip; press it again to flip back.
+   *
+   * Selection preservation: when the user clicks the "Text Editor" button
+   * (not the keyboard shortcut), the webview sends the markdown content plus
+   * start/end character offsets for the current selection. We apply the
+   * markdown to the document (so the text editor sees the latest content),
+   * open the text editor, then set the selection using those offsets.
    */
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'visualMarkdownEditor.toggleTextEditor',
-      async (uri?: vscode.Uri) => {
+      async (
+        uri?: vscode.Uri,
+        selection?: { markdown: string; startOffset: number; endOffset: number },
+      ) => {
         const activeTextEditor = vscode.window.activeTextEditor;
 
         // 1. Caller passed a URI (e.g. the webview's status-bar button) — use it.
@@ -96,11 +105,63 @@ export function activate(context: vscode.ExtensionContext) {
         const inTextEditor = !!activeTextEditor
           && activeTextEditor.document.uri.toString() === uri.toString();
 
-        const targetEditor = inTextEditor
-          ? 'visualMarkdownEditor.editor'
-          : 'default';
+        if (inTextEditor) {
+          // Text editor -> visual editor. No selection to preserve in this
+          // direction (mapping markdown offsets back to DOM ranges is a
+          // separate problem we don't solve here).
+          await vscode.commands.executeCommand('vscode.openWith', uri, 'visualMarkdownEditor.editor');
+          return;
+        }
 
-        await vscode.commands.executeCommand('vscode.openWith', uri, targetEditor);
+        // Visual editor -> text editor.
+        // If the webview provided selection offsets, sync the document first
+        // so the offsets line up with what the text editor will display.
+        if (selection) {
+          // Apply the webview's markdown to the document via a WorkspaceEdit.
+          // This ensures the text editor — which is about to open — sees the
+          // exact same content the offsets were computed against.
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const fullRange = new vscode.Range(
+            0, 0,
+            doc.lineCount, 0,
+          );
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(uri, fullRange, selection.markdown);
+          await vscode.workspace.applyEdit(edit);
+        }
+
+        // Open the document in the default Text Editor.
+        await vscode.commands.executeCommand('vscode.openWith', uri, 'default');
+
+        // If we have selection offsets, set the selection now. We need to wait
+        // briefly for the new text editor to become the active editor — VS
+        // Code doesn't give us a synchronous handle from `vscode.openWith`.
+        if (selection) {
+          // Wait for the text editor to be active. Poll up to ~500ms.
+          const deadline = Date.now() + 500;
+          while (Date.now() < deadline) {
+            const ed = vscode.window.activeTextEditor;
+            if (ed && ed.document.uri.toString() === uri.toString()) {
+              const doc = ed.document;
+              try {
+                const startPos = doc.positionAt(selection.startOffset);
+                const endPos = doc.positionAt(selection.endOffset);
+                ed.selection = new vscode.Selection(startPos, endPos);
+                // Reveal the selection in the viewport.
+                ed.revealRange(
+                  new vscode.Range(startPos, endPos),
+                  vscode.TextEditorRevealType.InCenterIfOutsideViewport,
+                );
+              } catch {
+                // Offsets were out of range — ignore and leave the cursor at 0:0.
+              }
+              return;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          // If we get here, the text editor never became active in time.
+          // The user can still select manually — not catastrophic.
+        }
       }
     )
   );

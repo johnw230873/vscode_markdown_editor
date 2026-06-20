@@ -1,0 +1,440 @@
+diff --git a/src/extension.ts b/src/extension.ts
+index 88b7ee0..3fc85db 100644
+--- a/src/extension.ts
++++ b/src/extension.ts
+@@ -65,11 +65,20 @@ export function activate(context: vscode.ExtensionContext) {
+    * Swapping to a real Text Editor — in the same tab, no split — restores all
+    * of those features. Press Ctrl+Alt+V (or click "Text Editor" in the status
+    * bar) to flip; press it again to flip back.
++   *
++   * Selection preservation: when the user clicks the "Text Editor" button
++   * (not the keyboard shortcut), the webview sends the markdown content plus
++   * start/end character offsets for the current selection. We apply the
++   * markdown to the document (so the text editor sees the latest content),
++   * open the text editor, then set the selection using those offsets.
+    */
+   context.subscriptions.push(
+     vscode.commands.registerCommand(
+       'visualMarkdownEditor.toggleTextEditor',
+-      async (uri?: vscode.Uri) => {
++      async (
++        uri?: vscode.Uri,
++        selection?: { markdown: string; startOffset: number; endOffset: number },
++      ) => {
+         const activeTextEditor = vscode.window.activeTextEditor;
+ 
+         // 1. Caller passed a URI (e.g. the webview's status-bar button) — use it.
+@@ -96,11 +105,63 @@ export function activate(context: vscode.ExtensionContext) {
+         const inTextEditor = !!activeTextEditor
+           && activeTextEditor.document.uri.toString() === uri.toString();
+ 
+-        const targetEditor = inTextEditor
+-          ? 'visualMarkdownEditor.editor'
+-          : 'default';
++        if (inTextEditor) {
++          // Text editor -> visual editor. No selection to preserve in this
++          // direction (mapping markdown offsets back to DOM ranges is a
++          // separate problem we don't solve here).
++          await vscode.commands.executeCommand('vscode.openWith', uri, 'visualMarkdownEditor.editor');
++          return;
++        }
+ 
+-        await vscode.commands.executeCommand('vscode.openWith', uri, targetEditor);
++        // Visual editor -> text editor.
++        // If the webview provided selection offsets, sync the document first
++        // so the offsets line up with what the text editor will display.
++        if (selection) {
++          // Apply the webview's markdown to the document via a WorkspaceEdit.
++          // This ensures the text editor — which is about to open — sees the
++          // exact same content the offsets were computed against.
++          const doc = await vscode.workspace.openTextDocument(uri);
++          const fullRange = new vscode.Range(
++            0, 0,
++            doc.lineCount, 0,
++          );
++          const edit = new vscode.WorkspaceEdit();
++          edit.replace(uri, fullRange, selection.markdown);
++          await vscode.workspace.applyEdit(edit);
++        }
++
++        // Open the document in the default Text Editor.
++        await vscode.commands.executeCommand('vscode.openWith', uri, 'default');
++
++        // If we have selection offsets, set the selection now. We need to wait
++        // briefly for the new text editor to become the active editor — VS
++        // Code doesn't give us a synchronous handle from `vscode.openWith`.
++        if (selection) {
++          // Wait for the text editor to be active. Poll up to ~500ms.
++          const deadline = Date.now() + 500;
++          while (Date.now() < deadline) {
++            const ed = vscode.window.activeTextEditor;
++            if (ed && ed.document.uri.toString() === uri.toString()) {
++              const doc = ed.document;
++              try {
++                const startPos = doc.positionAt(selection.startOffset);
++                const endPos = doc.positionAt(selection.endOffset);
++                ed.selection = new vscode.Selection(startPos, endPos);
++                // Reveal the selection in the viewport.
++                ed.revealRange(
++                  new vscode.Range(startPos, endPos),
++                  vscode.TextEditorRevealType.InCenterIfOutsideViewport,
++                );
++              } catch {
++                // Offsets were out of range — ignore and leave the cursor at 0:0.
++              }
++              return;
++            }
++            await new Promise((resolve) => setTimeout(resolve, 25));
++          }
++          // If we get here, the text editor never became active in time.
++          // The user can still select manually — not catastrophic.
++        }
+       }
+     )
+   );
+diff --git a/src/markdownEditorProvider.ts b/src/markdownEditorProvider.ts
+index 1a3b04b..44e7097 100644
+--- a/src/markdownEditorProvider.ts
++++ b/src/markdownEditorProvider.ts
+@@ -110,7 +110,22 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
+         case 'toggleTextEditor': {
+           // User clicked the "Text Editor" button inside the webview.
+           // Delegate to the registered command so we have one code path.
+-          vscode.commands.executeCommand('visualMarkdownEditor.toggleTextEditor', document.uri);
++          //
++          // If the webview also sent selection offsets (because the user had
++          // a non-collapsed selection), pass them through so the text editor
++          // can auto-select the equivalent range after opening.
++          const offsets = (typeof message.startOffset === 'number' && typeof message.endOffset === 'number')
++            ? {
++                markdown: message.markdown as string,
++                startOffset: message.startOffset as number,
++                endOffset: message.endOffset as number,
++              }
++            : undefined;
++          vscode.commands.executeCommand(
++            'visualMarkdownEditor.toggleTextEditor',
++            document.uri,
++            offsets,
++          );
+           return;
+         }
+       }
+diff --git a/src/webview/features/selectionMapping.ts b/src/webview/features/selectionMapping.ts
+new file mode 100644
+index 0000000..588ff01
+--- /dev/null
++++ b/src/webview/features/selectionMapping.ts
+@@ -0,0 +1,252 @@
++// Map a DOM selection inside the WYSIWYG editor to character offsets in the
++// equivalent markdown source.
++//
++// Used when the user clicks the "Text Editor" button: we want the selection
++// they had in the visual editor to be preserved (as closely as possible) in
++// the raw-markdown Text Editor that opens.
++//
++// Algorithm:
++//   - For each endpoint (start / end) of the selection, walk up the DOM to
++//     find the containing block element (P, H1-H6, LI, BLOCKQUOTE, etc.).
++//   - Find the markdown line whose "stripped" text matches the block's text.
++//   - Within that markdown line, find where the in-block text-before-endpoint
++//     starts, and add the length to get the offset.
++//   - If we can't match a block (rare — e.g., selection in an unknown tag),
++//     fall back to a proportional offset based on plain-text position.
++//
++// Caveats:
++//   - Approximate, not pixel-perfect. Inline syntax like `**bold**` or
++//     `[text](url)` complicates the within-line mapping; we use a forgiving
++//     substring search.
++//   - Multi-block selections work (start and end are computed independently).
++//   - Code blocks (PRE) are handled by matching the fence + content.
++
++import { editor } from '../state';
++import { htmlToMarkdown } from '../markdown';
++
++const BLOCK_TAGS = new Set([
++  'P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI',
++  'BLOCKQUOTE', 'PRE', 'DIV', 'TD', 'TH', 'HR',
++]);
++
++export interface MarkdownSelectionOffsets {
++  /** Full markdown content (so the extension can sync the doc before selecting). */
++  markdown: string;
++  /** Character offset in `markdown` where the selection starts. */
++  startOffset: number;
++  /** Character offset in `markdown` where the selection ends. */
++  endOffset: number;
++}
++
++/**
++ * Compute the markdown character offsets corresponding to the editor's current
++ * DOM selection. Returns `null` if there's no selection or the selection is
++ * collapsed (cursor only — we don't bother mapping a cursor, only a range).
++ */
++export function getMarkdownOffsetsForSelection(): MarkdownSelectionOffsets | null {
++  const sel = window.getSelection();
++  if (!sel || !sel.rangeCount) return null;
++  if (sel.isCollapsed) return null; // cursor only — nothing to map
++  if (!editor.contains(sel.getRangeAt(0).startContainer)) return null;
++  if (!editor.contains(sel.getRangeAt(0).endContainer)) return null;
++
++  const markdown = htmlToMarkdown(editor.innerHTML);
++  const startOffset = getOffsetForPosition(markdown, sel.getRangeAt(0).startContainer, sel.getRangeAt(0).startOffset);
++  const endOffset = getOffsetForPosition(markdown, sel.getRangeAt(0).endContainer, sel.getRangeAt(0).endOffset);
++
++  // Guard against reversed / equal offsets (shouldn't happen but be defensive).
++  if (endOffset < startOffset) {
++    return { markdown, startOffset: endOffset, endOffset: startOffset };
++  }
++  if (startOffset === endOffset) return null;
++
++  return { markdown, startOffset, endOffset };
++}
++
++/**
++ * Compute the markdown character offset for a single (node, offset) position
++ * inside the editor. Walks up to the containing block, finds the matching
++ * markdown line, then adds a within-line offset.
++ */
++function getOffsetForPosition(md: string, container: Node, offset: number): number {
++  const mdLines = md.split('\n');
++
++  // Walk up from the position to find the nearest block-level element.
++  let blockEl: Element | null = null;
++  let cur: Node | null = container;
++  while (cur && cur !== editor) {
++    if (cur.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has((cur as Element).tagName)) {
++      blockEl = cur as Element;
++      break;
++    }
++    cur = cur.parentNode;
++  }
++
++  if (!blockEl) {
++    return proportionalFallback(md, mdLines, container, offset);
++  }
++
++  // Special case: PRE (code block) — match the fence + content.
++  if (blockEl.tagName === 'PRE') {
++    return getOffsetInCodeBlock(md, mdLines, blockEl, container, offset);
++  }
++
++  // Find the markdown line corresponding to this block.
++  const blockText = (blockEl.textContent || '').trim().replace(/\s+/g, ' ');
++  const needle = blockText.slice(0, 40);
++  let targetLine = -1;
++
++  if (needle.length >= 3) {
++    for (let i = 0; i < mdLines.length; i++) {
++      const stripped = mdLines[i]
++        .replace(/^[#\s\-*+>`|[\]!]+/, '')
++        .trim()
++        .replace(/\s+/g, ' ');
++      if (stripped.length >= 3 && needle.startsWith(stripped.slice(0, Math.min(stripped.length, 30)))) {
++        targetLine = i;
++        break;
++      }
++    }
++  }
++
++  if (targetLine === -1) {
++    return proportionalFallback(md, mdLines, container, offset);
++  }
++
++  // Compute the line's starting character offset in the full markdown.
++  let lineStart = 0;
++  for (let i = 0; i < targetLine; i++) {
++    lineStart += mdLines[i].length + 1; // +1 for '\n'
++  }
++
++  // Get the text BEFORE the position, scoped to the block element.
++  const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
++  let textBefore = '';
++  let node: Node | null;
++  while ((node = walker.nextNode())) {
++    if (node === container) {
++      textBefore += (node.textContent ?? '').slice(0, offset);
++      break;
++    }
++    textBefore += node.textContent ?? '';
++  }
++  const normalizedBefore = textBefore.replace(/\s+/g, ' ').trim();
++
++  // Find where this text starts in the markdown line (after stripping leading
++  // syntax characters like `#`, `-`, `>`, etc.).
++  const mdLine = mdLines[targetLine];
++  const leadingSyntax = mdLine.match(/^[#\s\-*+>`|[\]!]+/);
++  const strippedStart = leadingSyntax ? leadingSyntax[0].length : 0;
++  const strippedLine = mdLine.slice(strippedStart);
++
++  const withinLine = findApproximateIndex(strippedLine, normalizedBefore);
++
++  return lineStart + strippedStart + withinLine;
++}
++
++/**
++ * For code blocks: find the ``` fence in markdown and map the position within
++ * the <pre><code> element to a character offset inside the fenced block.
++ */
++function getOffsetInCodeBlock(
++  md: string,
++  mdLines: string[],
++  preEl: Element,
++  container: Node,
++  offset: number,
++): number {
++  const codeText = (preEl.querySelector('code')?.textContent || preEl.textContent || '');
++  const codeLines = codeText.split('\n');
++  // Use the first non-empty line of the code as a needle.
++  const needle = codeLines.find(l => l.trim().length >= 3)?.trim().slice(0, 40) || '';
++
++  // Find a ``` fence line in markdown followed by a line containing the needle.
++  for (let i = 0; i < mdLines.length - 1; i++) {
++    if (mdLines[i].trim().startsWith('```')) {
++      // Check if the next line matches the needle.
++      if (needle && mdLines[i + 1].includes(needle.slice(0, Math.min(needle.length, 20)))) {
++        // Found the code block. Compute the text-before-position within <pre>.
++        const walker = document.createTreeWalker(preEl, NodeFilter.SHOW_TEXT);
++        let textBefore = '';
++        let node: Node | null;
++        let matchedNode = false;
++        while ((node = walker.nextNode())) {
++          if (node === container) {
++            textBefore += (node.textContent ?? '').slice(0, offset);
++            matchedNode = true;
++            break;
++          }
++          textBefore += node.textContent ?? '';
++        }
++        if (!matchedNode) return 0;
++
++        // Offset = start of fence line + fence line length + 1 (for \n) + textBefore length
++        let fenceStart = 0;
++        for (let j = 0; j < i; j++) {
++          fenceStart += mdLines[j].length + 1;
++        }
++        return fenceStart + mdLines[i].length + 1 + textBefore.length;
++      }
++    }
++  }
++
++  return proportionalFallback(md, mdLines, container, offset);
++}
++
++/**
++ * Last-resort proportional mapping: compute the plain-text position of the
++ * endpoint as a fraction of the editor's total plain text, then map that
++ * fraction to a character offset in the markdown.
++ */
++function proportionalFallback(
++  md: string,
++  mdLines: string[],
++  container: Node,
++  offset: number,
++): number {
++  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
++  let textBefore = '';
++  let node: Node | null;
++  while ((node = walker.nextNode())) {
++    if (node === container) {
++      textBefore += (node.textContent ?? '').slice(0, offset);
++      break;
++    }
++    textBefore += node.textContent ?? '';
++  }
++  const total = editor.innerText || '';
++  if (total.length === 0) return 0;
++
++  const ratio = textBefore.length / total.length;
++  const targetLine = Math.floor(ratio * mdLines.length);
++  const clamped = Math.max(0, Math.min(targetLine, mdLines.length - 1));
++  return mdLines.slice(0, clamped).join('\n').length + (clamped > 0 ? 1 : 0);
++}
++
++/**
++ * Find the index of `needle` in `haystack`, with progressively looser matching
++ * if exact search fails. Returns 0 if nothing matches.
++ */
++function findApproximateIndex(haystack: string, needle: string): number {
++  if (!needle) return 0;
++  // Exact match.
++  let idx = haystack.indexOf(needle);
++  if (idx >= 0) return idx;
++  // First ~10 chars.
++  if (needle.length > 10) {
++    idx = haystack.indexOf(needle.slice(0, 10));
++    if (idx >= 0) return idx;
++  }
++  // First 5 chars.
++  if (needle.length > 5) {
++    idx = haystack.indexOf(needle.slice(0, 5));
++    if (idx >= 0) return idx;
++  }
++  // First non-whitespace character.
++  const firstChar = needle.trim()[0];
++  if (firstChar) {
++    idx = haystack.indexOf(firstChar);
++    if (idx >= 0) return idx;
++  }
++  return 0;
++}
+diff --git a/src/webview/features/textEditorToggle.ts b/src/webview/features/textEditorToggle.ts
+index c42575f..e0b423f 100644
+--- a/src/webview/features/textEditorToggle.ts
++++ b/src/webview/features/textEditorToggle.ts
+@@ -1,17 +1,32 @@
+ // "Text Editor" status-bar button: posts a message to the extension host to
+ // toggle the current document to VS Code's built-in Text Editor (and back).
+ //
++// If the user has a non-collapsed selection in the visual editor when they
++// click the button, we also compute the equivalent markdown character offsets
++// and send them along — so the text editor can auto-select the same text.
++//
+ // This is the in-webview counterpart of the `visualMarkdownEditor.toggleTextEditor`
+-// command. It exists so the user has a visible button to click (not just a
+-// keyboard shortcut), and because the webview can't invoke VS Code commands
+-// directly — it has to ask the extension host to do it.
++// command. The keyboard shortcut (Ctrl+Alt+V) bypasses the webview, so it
++// can't carry a selection — only the button click can.
+ 
+ import { postMessage } from '../vscodeApi';
++import { getMarkdownOffsetsForSelection } from './selectionMapping';
+ 
+ export function initTextEditorToggle(): void {
+   const btn = document.getElementById('toggleTextEditorBtn');
+   if (!btn) return;
+   btn.addEventListener('click', () => {
+-    postMessage({ type: 'toggleTextEditor' });
++    const offsets = getMarkdownOffsetsForSelection();
++    if (offsets) {
++      postMessage({
++        type: 'toggleTextEditor',
++        markdown: offsets.markdown,
++        startOffset: offsets.startOffset,
++        endOffset: offsets.endOffset,
++      });
++    } else {
++      // No selection (or collapsed cursor) — just toggle without selection.
++      postMessage({ type: 'toggleTextEditor' });
++    }
+   });
+ }
+diff --git a/src/webview/vscodeApi.ts b/src/webview/vscodeApi.ts
+index 90019c5..dd7dea9 100644
+--- a/src/webview/vscodeApi.ts
++++ b/src/webview/vscodeApi.ts
+@@ -17,7 +17,13 @@ export type VsCodeMessage =
+   | { type: 'deleteImage'; relativePath: string }
+   | { type: 'addCustomWord'; word: string }
+   | { type: 'showInfo'; text: string }
+-  | { type: 'toggleTextEditor' };
++  | { type: 'toggleTextEditor' }
++  | {
++      type: 'toggleTextEditor';
++      markdown: string;
++      startOffset: number;
++      endOffset: number;
++    };
+ 
+ export function postMessage(message: VsCodeMessage): void {
+   vscode.postMessage(message);
