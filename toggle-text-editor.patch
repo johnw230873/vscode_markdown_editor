@@ -1,0 +1,3748 @@
+diff --git a/media/editor.css b/media/editor.css
+index b6381dd..85b48da 100644
+--- a/media/editor.css
++++ b/media/editor.css
+@@ -432,33 +432,6 @@ body {
+   background: color-mix(in srgb, var(--editor-page-bg) 95%, var(--focus-border));
+ }
+ 
+-/* ── Source View ── */
+-#sourceContainer {
+-  flex: 1;
+-  display: flex;
+-  padding: 10px;
+-}
+-
+-#sourceEditor {
+-  width: 100%;
+-  height: 100%;
+-  background: var(--input-bg);
+-  color: var(--input-fg);
+-  border: 1px solid var(--input-border);
+-  border-radius: 3px;
+-  padding: 15px;
+-  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', 'Courier New', monospace;
+-  font-size: 13px;
+-  line-height: 1.6;
+-  resize: none;
+-  outline: none;
+-  tab-size: 2;
+-}
+-
+-#sourceEditor:focus {
+-  border-color: var(--focus-border);
+-}
+-
+ /* ── Status Bar ── */
+ #statusBar {
+   background: var(--status-bg);
+@@ -805,19 +778,16 @@ body {
+ }
+ 
+ /* ── Scrollbar styling ── */
+-#editorContainer::-webkit-scrollbar,
+-#sourceEditor::-webkit-scrollbar {
++#editorContainer::-webkit-scrollbar {
+   width: 10px;
+ }
+ 
+-#editorContainer::-webkit-scrollbar-thumb,
+-#sourceEditor::-webkit-scrollbar-thumb {
++#editorContainer::-webkit-scrollbar-thumb {
+   background: var(--scrollbar-bg);
+   border-radius: 5px;
+ }
+ 
+-#editorContainer::-webkit-scrollbar-track,
+-#sourceEditor::-webkit-scrollbar-track {
++#editorContainer::-webkit-scrollbar-track {
+   background: transparent;
+ }
+ 
+diff --git a/package.json b/package.json
+index ad7d147..6e1acc3 100644
+--- a/package.json
++++ b/package.json
+@@ -39,6 +39,19 @@
+       {
+         "command": "visualMarkdownEditor.newDocument",
+         "title": "Visual Markdown: New Document"
++      },
++      {
++        "command": "visualMarkdownEditor.toggleTextEditor",
++        "title": "Visual Markdown: Toggle Text Editor",
++        "shortTitle": "Toggle Text Editor"
++      }
++    ],
++    "keybindings": [
++      {
++        "command": "visualMarkdownEditor.toggleTextEditor",
++        "key": "ctrl+alt+v",
++        "mac": "cmd+alt+v",
++        "when": "editorLangId == markdown || activeCustomEditorId == 'visualMarkdownEditor.editor'"
+       }
+     ],
+     "menus": {
+@@ -48,6 +61,12 @@
+           "when": "resourceExtname == .md || resourceExtname == .markdown",
+           "group": "navigation"
+         }
++      ],
++      "commandPalette": [
++        {
++          "command": "visualMarkdownEditor.toggleTextEditor",
++          "when": "editorLangId == markdown || activeCustomEditorId == 'visualMarkdownEditor.editor'"
++        }
+       ]
+     }
+   },
+diff --git a/src/extension.ts b/src/extension.ts
+index 1e5c8ca..88b7ee0 100644
+--- a/src/extension.ts
++++ b/src/extension.ts
+@@ -55,6 +55,55 @@ export function activate(context: vscode.ExtensionContext) {
+       await vscode.commands.executeCommand('vscode.openWith', uri, 'visualMarkdownEditor.editor');
+     })
+   );
++
++  /**
++   * Toggle the active Markdown file between the Visual Markdown Editor (custom
++   * webview editor) and VS Code's built-in Text Editor.
++   *
++   * Why this exists: the visual editor is a webview, so Copilot Chat / inline
++   * completions / `#selection` can't see what the user has selected inside it.
++   * Swapping to a real Text Editor — in the same tab, no split — restores all
++   * of those features. Press Ctrl+Alt+V (or click "Text Editor" in the status
++   * bar) to flip; press it again to flip back.
++   */
++  context.subscriptions.push(
++    vscode.commands.registerCommand(
++      'visualMarkdownEditor.toggleTextEditor',
++      async (uri?: vscode.Uri) => {
++        const activeTextEditor = vscode.window.activeTextEditor;
++
++        // 1. Caller passed a URI (e.g. the webview's status-bar button) — use it.
++        // 2. User is currently in a Text Editor — use that document's URI.
++        // 3. User is in the visual editor (webview focused) — fall back to the
++        //    most recently active custom editor URI tracked by the provider.
++        if (!uri) {
++          if (activeTextEditor) {
++            uri = activeTextEditor.document.uri;
++          } else {
++            uri = MarkdownEditorProvider.getActiveUri();
++          }
++        }
++
++        if (!uri) {
++          vscode.window.showWarningMessage(
++            'Toggle Text Editor: open a Markdown file first.'
++          );
++          return;
++        }
++
++        // If a Text Editor is currently active for this URI, switch to the
++        // visual editor. Otherwise switch to the default Text Editor.
++        const inTextEditor = !!activeTextEditor
++          && activeTextEditor.document.uri.toString() === uri.toString();
++
++        const targetEditor = inTextEditor
++          ? 'visualMarkdownEditor.editor'
++          : 'default';
++
++        await vscode.commands.executeCommand('vscode.openWith', uri, targetEditor);
++      }
++    )
++  );
+ }
+ 
+ export function deactivate() {}
+diff --git a/src/markdownEditorProvider.ts b/src/markdownEditorProvider.ts
+index 5fc0dc4..1a3b04b 100644
+--- a/src/markdownEditorProvider.ts
++++ b/src/markdownEditorProvider.ts
+@@ -4,6 +4,21 @@ import * as crypto from 'crypto';
+ import * as fs from 'fs';
+ 
+ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
++  /**
++   * Most recently activated custom-editor URI. Used by the
++   * `visualMarkdownEditor.toggleTextEditor` command to know which document to
++   * swap to a Text Editor when the user is focused inside the webview (where
++   * `vscode.window.activeTextEditor` is undefined).
++   */
++  private static activeUri: string | undefined;
++
++  /** Returns the URI of the currently-active visual editor, if any. */
++  static getActiveUri(): vscode.Uri | undefined {
++    return MarkdownEditorProvider.activeUri
++      ? vscode.Uri.parse(MarkdownEditorProvider.activeUri)
++      : undefined;
++  }
++
+   constructor(private readonly context: vscode.ExtensionContext) {}
+ 
+   async resolveCustomTextEditor(
+@@ -91,8 +106,30 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
+         case 'showInfo':
+           vscode.window.showInformationMessage(message.text);
+           return;
++
++        case 'toggleTextEditor': {
++          // User clicked the "Text Editor" button inside the webview.
++          // Delegate to the registered command so we have one code path.
++          vscode.commands.executeCommand('visualMarkdownEditor.toggleTextEditor', document.uri);
++          return;
++        }
++      }
++    });
++
++    // Track which custom editor is currently active so the toggle command can
++    // find the right URI when the user invokes it via keyboard shortcut while
++    // the webview has focus (where `activeTextEditor` is undefined).
++    webviewPanel.onDidChangeViewState((e) => {
++      if (e.webviewPanel.active) {
++        MarkdownEditorProvider.activeUri = document.uri.toString();
++      } else if (MarkdownEditorProvider.activeUri === document.uri.toString()) {
++        MarkdownEditorProvider.activeUri = undefined;
+       }
+     });
++    // If this is the first custom editor to open, mark it active immediately.
++    if (webviewPanel.active) {
++      MarkdownEditorProvider.activeUri = document.uri.toString();
++    }
+ 
+     const changeDocumentSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
+       if (e.document.uri.toString() === document.uri.toString() && e.contentChanges.length > 0) {
+@@ -104,6 +141,9 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
+ 
+     webviewPanel.onDidDispose(() => {
+       changeDocumentSubscription.dispose();
++      if (MarkdownEditorProvider.activeUri === document.uri.toString()) {
++        MarkdownEditorProvider.activeUri = undefined;
++      }
+     });
+ 
+     // Set HTML last — this triggers webview script execution
+@@ -464,16 +504,12 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
+     </div>
+   </div>
+ 
+-  <div id="sourceContainer" style="display:none;">
+-    <textarea id="sourceEditor" spellcheck="false"></textarea>
+-  </div>
+-
+   <div id="statusBar">
+     <span id="wordCount">Words: 0</span>
+     <span id="charCount">Characters: 0</span>
+     <span id="cursorPosition"></span>
+     <span class="status-spacer"></span>
+-    <button class="status-btn" id="toggleSourceBtn" title="Toggle Source View">&#x2328; Source</button>
++    <button class="status-btn" id="toggleTextEditorBtn" title="Switch to Text Editor (Ctrl+Alt+V) for raw markdown, Copilot Chat, and multi-cursor editing">&#x2328; Text Editor</button>
+     <button class="status-btn" id="toggleNavBtn" title="Toggle Outline">&#x2630; Outline</button>
+     <button class="status-btn" id="togglePageModeBtn" title="Toggle Page Mode">&#x1F4C4; Page</button>
+     <span class="status-separator"></span>
+diff --git a/src/webview.ts b/src/webview.ts
+index f7821b9..ec7f513 100644
+--- a/src/webview.ts
++++ b/src/webview.ts
+@@ -1,1609 +1,49 @@
+-import { marked } from 'marked';
+-import TurndownService from 'turndown';
+-import { gfm } from 'turndown-plugin-gfm';
+-import words from 'an-array-of-english-words';
+-
+-declare function acquireVsCodeApi(): {
+-  postMessage(message: unknown): void;
+-  getState(): unknown;
+-  setState(state: unknown): void;
+-};
+-
+-const vscode = acquireVsCodeApi();
+-
+-// ── Spell Check Dictionary (client-side) ──
+-const dictionary = new Set(words);
+-['i', 'a', 'vs', 'ok', 'eg', 'ie', 'etc', 'url', 'html', 'css', 'js', 'ts',
+- 'api', 'ui', 'id', 'pdf', 'http', 'https', 'www', 'dev', 'src', 'img'].forEach(w => dictionary.add(w));
+-
+-function checkWord(word: string): boolean {
+-  if (word.length < 2) return true;
+-  const lower = word.toLowerCase();
+-  return dictionary.has(lower) || dictionary.has(word);
+-}
+-
+-function edits1(word: string): string[] {
+-  const results: string[] = [];
+-  const letters = 'abcdefghijklmnopqrstuvwxyz';
+-  for (let i = 0; i <= word.length; i++) {
+-    if (i < word.length) results.push(word.slice(0, i) + word.slice(i + 1));
+-    for (const c of letters) results.push(word.slice(0, i) + c + word.slice(i));
+-    if (i < word.length) {
+-      for (const c of letters) results.push(word.slice(0, i) + c + word.slice(i + 1));
+-    }
+-    if (i < word.length - 1) results.push(word.slice(0, i) + word[i + 1] + word[i] + word.slice(i + 2));
+-  }
+-  return results;
+-}
+-
+-function getSuggestions(word: string, max: number = 6): string[] {
+-  const lower = word.toLowerCase();
+-  const suggestions: string[] = [];
+-  const seen = new Set<string>();
+-
+-  for (const candidate of edits1(lower)) {
+-    if (dictionary.has(candidate) && !seen.has(candidate)) {
+-      seen.add(candidate);
+-      suggestions.push(candidate);
+-      if (suggestions.length >= max) return suggestions;
+-    }
+-  }
+-
+-  // Limited edit distance 2
+-  if (suggestions.length < max) {
+-    const e1 = edits1(lower);
+-    const limit = Math.min(e1.length, 50);
+-    for (let i = 0; i < limit && suggestions.length < max; i++) {
+-      for (const candidate of edits1(e1[i])) {
+-        if (dictionary.has(candidate) && !seen.has(candidate) && candidate !== lower) {
+-          seen.add(candidate);
+-          suggestions.push(candidate);
+-          if (suggestions.length >= max) return suggestions;
+-        }
+-      }
+-    }
+-  }
+-  return suggestions;
+-}
+-
+-// ── Marked configuration ──
+-marked.setOptions({
+-  gfm: true,
+-  breaks: true,
+-});
+-
+-// ── Turndown configuration ──
+-const turndownService = new TurndownService({
+-  headingStyle: 'atx',
+-  hr: '---',
+-  bulletListMarker: '-',
+-  codeBlockStyle: 'fenced',
+-  fence: '```',
+-  emDelimiter: '*',
+-  strongDelimiter: '**',
+-  linkStyle: 'inlined',
+-});
+-turndownService.use(gfm);
+-
+-// Keep style spans (colors, font-size, etc.)
+-turndownService.addRule('styledSpan', {
+-  filter: (node) => {
+-    return node.nodeName === 'SPAN' && !!(node as HTMLElement).getAttribute('style');
+-  },
+-  replacement: (content, node) => {
+-    const el = node as HTMLElement;
+-    const style = el.getAttribute('style') || '';
+-    if (!content.trim()) return '';
+-    return `<span style="${style}">${content}</span>`;
+-  },
+-});
+-
+-// Keep underline
+-turndownService.addRule('underline', {
+-  filter: ['u'],
+-  replacement: (content) => {
+-    if (!content.trim()) return '';
+-    return `<u>${content}</u>`;
+-  },
+-});
+-
+-// Keep superscript/subscript
+-turndownService.addRule('superscript', {
+-  filter: ['sup'],
+-  replacement: (content) => `<sup>${content}</sup>`,
+-});
+-turndownService.addRule('subscript', {
+-  filter: ['sub'],
+-  replacement: (content) => `<sub>${content}</sub>`,
+-});
+-
+-// Keep alignment divs
+-turndownService.addRule('alignedDiv', {
+-  filter: (node) => {
+-    if (node.nodeName !== 'DIV') return false;
+-    const style = (node as HTMLElement).getAttribute('style') || '';
+-    return /text-align/.test(style);
+-  },
+-  replacement: (content, node) => {
+-    const el = node as HTMLElement;
+-    const style = el.getAttribute('style') || '';
+-    return `<div style="${style}">\n\n${content}\n\n</div>\n\n`;
+-  },
+-});
+-
+-// Keep font tags (from execCommand fontSize)
+-turndownService.addRule('fontTag', {
+-  filter: ['font'],
+-  replacement: (content, node) => {
+-    const el = node as HTMLElement;
+-    const color = el.getAttribute('color');
+-    const size = el.getAttribute('size');
+-    const face = el.getAttribute('face');
+-    const styles: string[] = [];
+-    if (color) styles.push(`color: ${color}`);
+-    if (size) {
+-      const sizeMap: Record<string, string> = {
+-        '1': '8pt', '2': '10pt', '3': '12pt', '4': '14pt',
+-        '5': '18pt', '6': '24pt', '7': '36pt',
+-      };
+-      styles.push(`font-size: ${sizeMap[size] || size}`);
+-    }
+-    if (face) styles.push(`font-family: ${face}`);
+-    if (styles.length === 0) return content;
+-    return `<span style="${styles.join('; ')}">${content}</span>`;
+-  },
+-});
+-
+-// Task list support
+-turndownService.addRule('taskListItem', {
+-  filter: (node) => {
+-    return (
+-      node.nodeName === 'LI' &&
+-      (node as HTMLElement).querySelector('input[type="checkbox"]') !== null
+-    );
+-  },
+-  replacement: (content, node) => {
+-    const el = node as HTMLElement;
+-    const checkbox = el.querySelector('input[type="checkbox"]') as HTMLInputElement;
+-    const checked = checkbox?.checked ? 'x' : ' ';
+-    const text = content.replace(/^\s*\[.\]\s*/, '').trim();
+-    return `- [${checked}] ${text}\n`;
+-  },
+-});
+-
+-// Keep mark/highlight
+-turndownService.addRule('mark', {
+-  filter: ['mark'],
+-  replacement: (content) => `<mark>${content}</mark>`,
+-});
+-
+-// ── DOM Elements ──
+-const editor = document.getElementById('editor')!;
+-const sourceEditor = document.getElementById('sourceEditor') as HTMLTextAreaElement;
+-const editorContainer = document.getElementById('editorContainer')!;
+-const sourceContainer = document.getElementById('sourceContainer')!;
+-const wordCountEl = document.getElementById('wordCount')!;
+-const charCountEl = document.getElementById('charCount')!;
+-const navPane = document.getElementById('navPane')!;
+-const navList = document.getElementById('navList')!;
+-
+-let isSourceView = false;
+-let isUpdatingFromExtension = false;
+-let isNavVisible = false;
+-let hasUserEdited = false;
+-let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+-let navUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+-
+-// ── Navigation Pane ──
+-function toggleNav(show?: boolean) {
+-  isNavVisible = show !== undefined ? show : !isNavVisible;
+-  navPane.style.display = isNavVisible ? 'flex' : 'none';
+-  const btn = document.getElementById('toggleNavBtn');
+-  if (btn) btn.classList.toggle('active', isNavVisible);
+-  if (isNavVisible) refreshNav();
+-}
+-
+-function refreshNav() {
+-  if (!isNavVisible) return;
+-  const headings = editor.querySelectorAll('h1, h2, h3, h4, h5, h6');
+-  navList.innerHTML = '';
+-
+-  headings.forEach((heading) => {
+-    const text = heading.textContent?.trim();
+-    if (!text) return; // Skip empty headings
+-    const level = parseInt(heading.tagName[1]);
+-    const btn = document.createElement('button');
+-    btn.className = 'nav-item';
+-    btn.setAttribute('data-level', String(level));
+-    btn.textContent = text;
+-    btn.title = text;
+-    btn.addEventListener('click', () => {
+-      heading.scrollIntoView({ behavior: 'smooth', block: 'start' });
+-      // Highlight briefly
+-      navList.querySelectorAll('.nav-item').forEach((el) => el.classList.remove('active'));
+-      btn.classList.add('active');
+-    });
+-    navList.appendChild(btn);
+-  });
+-
+-  if (headings.length === 0) {
+-    const empty = document.createElement('div');
+-    empty.style.padding = '12px';
+-    empty.style.fontSize = '12px';
+-    empty.style.opacity = '0.5';
+-    empty.textContent = 'No headings found';
+-    navList.appendChild(empty);
+-  }
+-}
+-
+-function scheduleNavRefresh() {
+-  if (navUpdateTimer) clearTimeout(navUpdateTimer);
+-  navUpdateTimer = setTimeout(refreshNav, 600);
+-}
+-
+-document.getElementById('toggleNavBtn')!.addEventListener('click', () => toggleNav());
+-document.getElementById('navCloseBtn')!.addEventListener('click', () => toggleNav(false));
+-
+-// ── Page Mode Toggle ──
+-const pageModeBtn = document.getElementById('togglePageModeBtn')!;
+-let isPageMode = false;
+-
+-pageModeBtn.addEventListener('click', () => {
+-  isPageMode = !isPageMode;
+-  editorContainer.classList.toggle('page-mode', isPageMode);
+-  pageModeBtn.classList.toggle('active', isPageMode);
+-  if (isPageMode) setZoom(100);
+-});
+-
+-// ── Zoom ──
+-const zoomSlider = document.getElementById('zoomSlider') as HTMLInputElement;
+-const zoomValue = document.getElementById('zoomValue')!;
+-let currentZoom = 100;
+-
+-function setZoom(level: number) {
+-  currentZoom = Math.max(50, Math.min(200, level));
+-  editor.style.zoom = `${currentZoom}%`;
+-  zoomSlider.value = String(currentZoom);
+-  zoomValue.textContent = `${currentZoom}%`;
+-}
+-
+-zoomSlider.addEventListener('input', () => {
+-  setZoom(parseInt(zoomSlider.value, 10));
+-});
+-
+-editorContainer.addEventListener('wheel', (e: WheelEvent) => {
+-  if (e.ctrlKey) {
+-    e.preventDefault();
+-    const delta = e.deltaY > 0 ? -10 : 10;
+-    setZoom(currentZoom + delta);
+-  }
+-}, { passive: false });
+-
+-// ── Markdown ↔ HTML conversion ──
+-function markdownToHtml(md: string): string {
+-  let html = marked.parse(md) as string;
+-  // Convert task list items
+-  html = html.replace(
+-    /<li>\s*\[([ xX])\]\s*/g,
+-    (_, checked) => {
+-      const isChecked = checked.toLowerCase() === 'x';
+-      return `<li class="task-list-item"><input type="checkbox" ${isChecked ? 'checked' : ''} onclick="this.parentElement.classList.toggle('checked', this.checked); scheduleSync();"> `;
+-    }
+-  );
+-  // Resolve relative image paths to webview URIs so images display
+-  const baseUri = (window as any).__baseUri as string;
+-  const attachmentsBaseUri = (window as any).__attachmentsBaseUri as string;
+-  if (baseUri) {
+-    html = html.replace(
+-      /<img\s+([^>]*?)src="(?!https?:\/\/|data:|blob:|vscode-)([^"]+)"([^>]*?)>/gi,
+-      (match, before, src, after) => {
+-        let actualSrc = src;
+-        let slashPrefix = false;
+-        // Leading slash (e.g. /.attachments/img.png) means one directory up
+-        if (src.startsWith('/.attachments/') || src.startsWith('/.attachments\\')) {
+-          actualSrc = src.slice(1); // Remove leading /
+-          slashPrefix = true;
+-        }
+-        let base: string;
+-        if (slashPrefix) {
+-          // /.attachments/ → resolve from parent (attachmentsBaseUri)
+-          base = attachmentsBaseUri || baseUri;
+-        } else {
+-          // .attachments/ or other relative → resolve from document directory
+-          base = baseUri;
+-        }
+-        const resolved = `${base}/${actualSrc}`;
+-        const dataAttr = slashPrefix ? ' data-slash-prefix="true"' : '';
+-        return `<img ${before}src="${resolved}"${dataAttr}${after}>`;
+-      }
+-    );
+-  }
+-  return html;
+-}
+-
+-function htmlToMarkdown(html: string): string {
+-  // Strip webview base URI from image src before conversion so markdown gets relative paths
+-  // IMPORTANT: strip baseUri (more specific/longer) BEFORE attachmentsBaseUri (parent)
+-  // to avoid partial matches leaving folder names like "markdown/" behind
+-  const baseUri = (window as any).__baseUri as string;
+-  const attachmentsBaseUri = (window as any).__attachmentsBaseUri as string;
+-  if (baseUri) {
+-    const escaped = baseUri.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+-    html = html.replace(new RegExp(escaped + '/', 'g'), '');
+-  }
+-  if (attachmentsBaseUri && attachmentsBaseUri !== baseUri) {
+-    const escaped = attachmentsBaseUri.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+-    html = html.replace(new RegExp(escaped + '/', 'g'), '');
+-  }
+-  // Restore leading slash for /.attachments/ paths that had it originally
+-  html = html.replace(
+-    /<img([^>]*?)data-slash-prefix="true"([^>]*?)>/gi,
+-    (match) => match.replace(/src="(\.attachments\/)/i, 'src="/.attachments/')
+-  );
+-  let md = turndownService.turndown(html);
+-  // Clean up extra blank lines
+-  md = md.replace(/\n{3,}/g, '\n\n');
+-  return md;
+-}
+-
+-// ── Sync to extension ──
+-function scheduleSync() {
+-  if (isUpdatingFromExtension) return;
+-  if (!hasUserEdited) return;
+-  if (debounceTimer) clearTimeout(debounceTimer);
+-  debounceTimer = setTimeout(() => {
+-    const md = isSourceView
+-      ? sourceEditor.value
+-      : htmlToMarkdown(editor.innerHTML);
+-    vscode.postMessage({ type: 'edit', content: md });
+-    updateWordCount(md);
+-  }, 500);
+-}
+-
+-// Make scheduleSync available globally for task list checkboxes
++// Webview entry point.
++// This file is intentionally thin: it imports every feature module and calls
++// their `init*()` functions in the right order. All logic lives in the
++// `./webview/*` modules.
++//
++// The only global side effect we expose to inline handlers (task-list
++// checkbox `onclick="scheduleSync()"`) is `window.scheduleSync`.
++
++import { postMessage } from './webview/vscodeApi';
++import { scheduleSync } from './webview/sync';
++import { initToolbar } from './webview/features/toolbar';
++import { initColors } from './webview/features/colors';
++import { initInsert } from './webview/features/insert';
++import { initOutline } from './webview/features/outline';
++import { initCursorTracking } from './webview/features/cursorTracking';
++import { initImageTransfer } from './webview/features/imageTransfer';
++import { initZoom } from './webview/features/zoom';
++import { initImageTooltip } from './webview/features/imageTooltip';
++import { initModals } from './webview/features/modals';
++import { initContextMenus } from './webview/features/contextMenus';
++import { initInput } from './webview/features/input';
++import { initMessages } from './webview/features/messages';
++import { initTextEditorToggle } from './webview/features/textEditorToggle';
++
++// Expose scheduleSync on window for inline onclick handlers in task-list
++// checkboxes (see markdown.ts -> markdownToHtml).
+ (window as any).scheduleSync = scheduleSync;
+ 
+-function updateWordCount(text: string) {
+-  const words = text.trim().split(/\s+/).filter((w) => w.length > 0).length;
+-  const chars = text.length;
+-  wordCountEl.textContent = `Words: ${words}`;
+-  charCountEl.textContent = `Characters: ${chars}`;
+-}
+-
+-// ── Toolbar commands ──
+-function execCmd(command: string, value?: string) {
+-  document.execCommand(command, false, value);
+-  editor.focus();
+-  hasUserEdited = true;
+-  scheduleSync();
+-}
+-
+-// Standard toolbar buttons
+-document.querySelectorAll('.toolbar-btn[data-command]').forEach((btn) => {
+-  btn.addEventListener('click', () => {
+-    const command = (btn as HTMLElement).dataset.command!;
+-    execCmd(command);
+-  });
+-});
+-
+-// Heading select
+-const headingSelect = document.getElementById('headingSelect') as HTMLSelectElement;
+-headingSelect.addEventListener('change', () => {
+-  const value = headingSelect.value;
+-  if (value === 'p') {
+-    execCmd('formatBlock', '<p>');
+-  } else {
+-    execCmd('formatBlock', `<${value}>`);
+-  }
+-  headingSelect.value = value;
+-});
+-
+-// Font size select
+-const fontSizeSelect = document.getElementById('fontSizeSelect') as HTMLSelectElement;
+-fontSizeSelect.addEventListener('change', () => {
+-  const value = fontSizeSelect.value;
+-  if (value) {
+-    execCmd('fontSize', value);
+-  }
+-  fontSizeSelect.value = '';
+-});
+-
+-// ── Color palette presets ──
+-const PRESET_COLORS = [
+-  '#000000', '#434343', '#666666', '#999999', '#cccccc', '#ffffff',
+-  '#ff0000', '#ff8c00', '#ffdd00', '#00b050', '#0070c0', '#7030a0',
+-  '#c00000', '#e36c09', '#bf9000', '#00823b', '#004080', '#4a1a6b',
+-];
+-
+-// ── Recent colors tracking ──
+-const MAX_RECENT_COLORS = 6;
+-let recentColors: string[] = JSON.parse(localStorage.getItem('recentColors') || '[]');
+-
+-function addRecentColor(color: string) {
+-  const normalized = color.toLowerCase();
+-  recentColors = recentColors.filter(c => c !== normalized);
+-  recentColors.unshift(normalized);
+-  if (recentColors.length > MAX_RECENT_COLORS) recentColors = recentColors.slice(0, MAX_RECENT_COLORS);
+-  localStorage.setItem('recentColors', JSON.stringify(recentColors));
+-  // Refresh all recent color rows
+-  document.querySelectorAll('.recent-colors-row').forEach(row => renderRecentRow(row as HTMLElement));
+-}
+-
+-function renderRecentRow(row: HTMLElement) {
+-  const onPick = (row as any)._onPick as (color: string) => void;
+-  row.innerHTML = '';
+-  if (recentColors.length === 0) {
+-    row.style.display = 'none';
+-    const sep = row.previousElementSibling;
+-    if (sep?.classList.contains('recent-colors-separator')) (sep as HTMLElement).style.display = 'none';
+-    return;
+-  }
+-  row.style.display = 'grid';
+-  const sep = row.previousElementSibling;
+-  if (sep?.classList.contains('recent-colors-separator')) (sep as HTMLElement).style.display = '';
+-  recentColors.forEach((color) => {
+-    const swatch = document.createElement('button');
+-    swatch.className = 'color-swatch';
+-    swatch.style.background = color;
+-    if (color === '#ffffff') swatch.style.borderColor = '#ccc';
+-    swatch.title = color;
+-    swatch.addEventListener('click', (e) => {
+-      e.stopPropagation();
+-      onPick(color);
+-    });
+-    row.appendChild(swatch);
+-  });
+-}
+-
+-function buildSwatches(containerId: string, onPick: (color: string) => void, onClear: () => void) {
+-  const container = document.getElementById(containerId)!;
+-
+-  // "None" swatch to remove color
+-  const noneSwatch = document.createElement('button');
+-  noneSwatch.className = 'color-swatch color-swatch-none';
+-  noneSwatch.title = 'None (remove color)';
+-  noneSwatch.innerHTML = '&#x2715;';
+-  noneSwatch.addEventListener('click', (e) => {
+-    e.stopPropagation();
+-    closeAllColorDropdowns();
+-    onClear();
+-  });
+-  container.appendChild(noneSwatch);
+-
+-  PRESET_COLORS.forEach((color) => {
+-    const swatch = document.createElement('button');
+-    swatch.className = 'color-swatch';
+-    swatch.style.background = color;
+-    if (color === '#ffffff') swatch.style.borderColor = '#ccc';
+-    swatch.title = color;
+-    swatch.addEventListener('click', (e) => {
+-      e.stopPropagation();
+-      addRecentColor(color);
+-      onPick(color);
+-    });
+-    container.appendChild(swatch);
+-  });
+-
+-  // Recent colors separator and row — append after the grid container
+-  const parent = container.parentElement!;
+-  const separator = document.createElement('div');
+-  separator.className = 'recent-colors-separator';
+-  separator.innerHTML = '<span>Recent</span>';
+-  parent.insertBefore(separator, container.nextSibling);
+-
+-  const recentRow = document.createElement('div');
+-  recentRow.className = 'recent-colors-row';
+-  (recentRow as any)._onPick = (color: string) => {
+-    addRecentColor(color);
+-    onPick(color);
+-  };
+-  parent.insertBefore(recentRow, separator.nextSibling);
+-  renderRecentRow(recentRow);
+-}
+-
+-function closeAllColorDropdowns() {
+-  document.querySelectorAll('.color-dropdown').forEach((d) => d.classList.remove('open'));
+-}
+-
+-// Text color
+-const textColorPicker = document.getElementById('textColorPicker') as HTMLInputElement;
+-const textColorBtn = document.getElementById('textColorBtn')!;
+-const textColorDropdown = document.getElementById('textColorDropdown')!;
+-
+-function applyTextColor(color: string) {
+-  textColorPicker.value = color;
+-  textColorBtn.style.borderBottomColor = color;
+-  closeAllColorDropdowns();
+-  execCmd('foreColor', color);
+-}
+-
+-textColorBtn.addEventListener('click', (e) => {
+-  e.stopPropagation();
+-  const isOpen = textColorDropdown.classList.contains('open');
+-  closeAllColorDropdowns();
+-  if (!isOpen) textColorDropdown.classList.add('open');
+-});
+-
+-textColorPicker.addEventListener('input', () => { addRecentColor(textColorPicker.value); applyTextColor(textColorPicker.value); });
+-buildSwatches('textColorSwatches', applyTextColor, () => {
+-  textColorBtn.style.borderBottomColor = 'transparent';
+-  closeAllColorDropdowns();
+-  execCmd('removeFormat');
+-});
+-
+-// Background color
+-const bgColorPicker = document.getElementById('bgColorPicker') as HTMLInputElement;
+-const bgColorBtn = document.getElementById('bgColorBtn')!;
+-const bgColorDropdown = document.getElementById('bgColorDropdown')!;
+-
+-function applyBgColor(color: string) {
+-  bgColorPicker.value = color;
+-  bgColorBtn.style.borderBottomColor = color;
+-  const indicator = bgColorBtn.querySelector('span') as HTMLElement;
+-  if (indicator) indicator.style.background = color;
+-  closeAllColorDropdowns();
+-  execCmd('hiliteColor', color);
+-}
+-
+-bgColorBtn.addEventListener('click', (e) => {
+-  e.stopPropagation();
+-  const isOpen = bgColorDropdown.classList.contains('open');
+-  closeAllColorDropdowns();
+-  if (!isOpen) bgColorDropdown.classList.add('open');
+-});
+-
+-bgColorPicker.addEventListener('input', () => { addRecentColor(bgColorPicker.value); applyBgColor(bgColorPicker.value); });
+-buildSwatches('bgColorSwatches', applyBgColor, () => {
+-  bgColorBtn.style.borderBottomColor = 'transparent';
+-  const indicator = bgColorBtn.querySelector('span') as HTMLElement;
+-  if (indicator) indicator.style.background = 'transparent';
+-  closeAllColorDropdowns();
+-  execCmd('hiliteColor', 'transparent');
+-});
+-
+-// Close color dropdowns on outside click
+-document.addEventListener('click', () => closeAllColorDropdowns());
+-
+-// Task list
+-document.getElementById('taskListBtn')!.addEventListener('click', () => {
+-  const html = `<ul class="task-list"><li class="task-list-item"><input type="checkbox" onclick="this.parentElement.classList.toggle('checked', this.checked); scheduleSync();"> Task item</li></ul>`;
+-  execCmd('insertHTML', html);
+-});
+-
+-// Mark / Highlight
+-document.getElementById('markBtn')!.addEventListener('click', () => {
+-  const sel = window.getSelection();
+-  const content = sel && sel.toString() ? escapeHtml(sel.toString()) : 'highlighted text';
+-  execCmd('insertHTML', `<mark>${content}</mark>`);
+-});
+-
+-// Link button
+-let editingLinkElement: HTMLAnchorElement | null = null;
+-document.getElementById('linkBtn')!.addEventListener('click', () => {
+-  editingLinkElement = null;
+-  const modal = document.getElementById('linkModal')!;
+-  const sel = window.getSelection();
+-  const selectedText = sel ? sel.toString() : '';
+-  (document.getElementById('linkText') as HTMLInputElement).value = selectedText;
+-  (document.getElementById('linkUrl') as HTMLInputElement).value = '';
+-  (document.getElementById('linkTitle') as HTMLInputElement).value = '';
+-  (document.getElementById('linkNewTab') as HTMLInputElement).checked = false;
+-  modal.style.display = 'flex';
+-  (document.getElementById('linkUrl') as HTMLInputElement).focus();
+-});
+-
+-document.getElementById('linkInsertOk')!.addEventListener('click', () => {
+-  const url = (document.getElementById('linkUrl') as HTMLInputElement).value;
+-  const text = (document.getElementById('linkText') as HTMLInputElement).value || url;
+-  const title = (document.getElementById('linkTitle') as HTMLInputElement).value;
+-  const newTab = (document.getElementById('linkNewTab') as HTMLInputElement).checked;
+-
+-  if (url) {
+-    if (editingLinkElement) {
+-      editingLinkElement.href = url;
+-      editingLinkElement.textContent = text;
+-      editingLinkElement.title = title;
+-      if (newTab) editingLinkElement.setAttribute('target', '_blank');
+-      else editingLinkElement.removeAttribute('target');
+-      editingLinkElement = null;
+-      hasUserEdited = true;
+-      scheduleSync();
+-    } else {
+-      let html = `<a href="${escapeHtml(url)}"`;
+-      if (title) html += ` title="${escapeHtml(title)}"`;
+-      if (newTab) html += ` target="_blank"`;
+-      html += `>${escapeHtml(text)}</a>`;
+-      execCmd('insertHTML', html);
+-    }
+-  }
+-  document.getElementById('linkModal')!.style.display = 'none';
+-});
+-
+-document.getElementById('linkInsertCancel')!.addEventListener('click', () => {
+-  document.getElementById('linkModal')!.style.display = 'none';
+-});
+-
+-// Image button
+-document.getElementById('imageBtn')!.addEventListener('click', () => {
+-  vscode.postMessage({ type: 'insertImage' });
+-});
+-
+-// Inline code
+-document.getElementById('inlineCodeBtn')!.addEventListener('click', () => {
+-  const sel = window.getSelection();
+-  if (sel && sel.toString()) {
+-    execCmd('insertHTML', `<code>${escapeHtml(sel.toString())}</code>`);
+-  } else {
+-    execCmd('insertHTML', '<code>code</code>');
+-  }
+-});
+-
+-// Code block
+-let savedCodeRange: Range | null = null;
+-document.getElementById('codeBlockBtn')!.addEventListener('click', () => {
+-  const sel = window.getSelection();
+-  if (sel && sel.rangeCount > 0) savedCodeRange = sel.getRangeAt(0).cloneRange();
+-  (document.getElementById('codeLanguageSelect') as HTMLSelectElement).value = '';
+-  document.getElementById('codeBlockModal')!.style.display = 'flex';
+-});
+-
+-document.getElementById('codeBlockInsertOk')!.addEventListener('click', () => {
+-  const lang = (document.getElementById('codeLanguageSelect') as HTMLSelectElement).value;
+-  const langAttr = lang ? ` class="language-${lang}"` : '';
+-  document.getElementById('codeBlockModal')!.style.display = 'none';
+-  editor.focus();
+-  if (savedCodeRange) {
+-    const s = window.getSelection();
+-    if (s) { s.removeAllRanges(); s.addRange(savedCodeRange); }
+-    savedCodeRange = null;
+-  }
+-  const selectedText = window.getSelection()?.toString() || 'code here';
+-  document.execCommand('insertHTML', false, `<pre><code${langAttr}>${escapeHtml(selectedText)}</code></pre><p><br></p>`);
+-  hasUserEdited = true;
+-  scheduleSync();
+-});
+-
+-document.getElementById('codeBlockInsertCancel')!.addEventListener('click', () => {
+-  document.getElementById('codeBlockModal')!.style.display = 'none';
+-  savedCodeRange = null;
+-});
+-
+-// Blockquote
+-document.getElementById('blockquoteBtn')!.addEventListener('click', () => {
+-  execCmd('formatBlock', '<blockquote>');
+-});
+-
+-// Horizontal rule
+-document.getElementById('hrBtn')!.addEventListener('click', () => {
+-  execCmd('insertHTML', '<hr><p><br></p>');
+-});
+-
+-// Table button
+-let savedTableRange: Range | null = null;
+-
+-document.getElementById('tableBtn')!.addEventListener('click', () => {
+-  // Save current selection/cursor position before modal steals focus
+-  const sel = window.getSelection();
+-  if (sel && sel.rangeCount > 0) {
+-    savedTableRange = sel.getRangeAt(0).cloneRange();
+-  }
+-  // Reset inputs to defaults
+-  (document.getElementById('tableRows') as HTMLInputElement).value = '3';
+-  (document.getElementById('tableCols') as HTMLInputElement).value = '3';
+-  document.getElementById('tableModal')!.style.display = 'flex';
+-  (document.getElementById('tableRows') as HTMLInputElement).focus();
+-});
+-
+-document.getElementById('tableInsertOk')!.addEventListener('click', () => {
+-  const rows = parseInt((document.getElementById('tableRows') as HTMLInputElement).value) || 3;
+-  const cols = parseInt((document.getElementById('tableCols') as HTMLInputElement).value) || 3;
+-  const hasHeader = (document.getElementById('tableHeader') as HTMLInputElement).checked;
+-
+-  let html = '<table>';
+-  if (hasHeader) {
+-    html += '<thead><tr>';
+-    for (let c = 0; c < cols; c++) {
+-      html += `<th>Header ${c + 1}</th>`;
+-    }
+-    html += '</tr></thead>';
+-  }
+-  html += '<tbody>';
+-  const startRow = hasHeader ? 1 : 0;
+-  for (let r = startRow; r < rows; r++) {
+-    html += '<tr>';
+-    for (let c = 0; c < cols; c++) {
+-      html += '<td>&nbsp;</td>';
+-    }
+-    html += '</tr>';
+-  }
+-  html += '</tbody></table><p><br></p>';
+-
+-  document.getElementById('tableModal')!.style.display = 'none';
+-
+-  // Restore focus and selection in the editor before inserting
+-  editor.focus();
+-  if (savedTableRange) {
+-    const sel = window.getSelection();
+-    if (sel) {
+-      sel.removeAllRanges();
+-      sel.addRange(savedTableRange);
+-    }
+-    savedTableRange = null;
+-  }
+-
+-  document.execCommand('insertHTML', false, html);
+-  hasUserEdited = true;
+-  scheduleSync();
+-});
+-
+-document.getElementById('tableInsertCancel')!.addEventListener('click', () => {
+-  document.getElementById('tableModal')!.style.display = 'none';
+-  savedTableRange = null;
+-});
+-
+-// ── Source position sync: find the char offset in markdown that matches the WYSIWYG cursor ──
+-function getSourceCharOffsetForCursor(md: string): number {
+-  const sel = window.getSelection();
+-  if (!sel || !sel.rangeCount) return 0;
+-  const range = sel.getRangeAt(0);
+-  if (!editor.contains(range.startContainer)) return 0;
+-
+-  const mdLines = md.split('\n');
+-
+-  // Walk up from the cursor node to find the nearest block-level element
+-  const BLOCK_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BLOCKQUOTE', 'PRE', 'DIV', 'TD', 'TH', 'HR']);
+-  let blockEl: Element | null = null;
+-  let cur: Node | null = range.startContainer;
+-  while (cur && cur !== editor) {
+-    if (cur.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has((cur as Element).tagName)) {
+-      blockEl = cur as Element;
+-      break;
+-    }
+-    cur = cur.parentNode;
+-  }
+-
+-  let targetLine = 0;
+-  let matched = false;
+-
+-  if (blockEl) {
+-    // Strip markdown-syntax characters from each line and look for a line whose
+-    // plain text matches the start of the block element's text content.
+-    const needle = (blockEl.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+-    if (needle.length >= 3) {
+-      for (let i = 0; i < mdLines.length; i++) {
+-        const stripped = mdLines[i]
+-          .replace(/^[#\s\-*+>`|[\]!]+/, '')  // strip leading syntax
+-          .trim()
+-          .replace(/\s+/g, ' ');
+-        if (stripped.length >= 3 && needle.startsWith(stripped.slice(0, Math.min(stripped.length, 30)))) {
+-          targetLine = i;
+-          matched = true;
+-          break;
+-        }
+-      }
+-    }
+-  }
+-
+-  if (!matched) {
+-    // Proportional fallback: use ratio of plain-text position to total plain text
+-    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+-    let textBefore = '';
+-    let node: Node | null;
+-    while ((node = walker.nextNode())) {
+-      if (node === range.startContainer) {
+-        textBefore += (node.textContent ?? '').slice(0, range.startOffset);
+-        break;
+-      }
+-      textBefore += node.textContent ?? '';
+-    }
+-    const total = editor.innerText || '';
+-    if (total.length > 0) {
+-      targetLine = Math.floor((textBefore.length / total.length) * mdLines.length);
+-    }
+-  }
+-
+-  const clamped = Math.max(0, Math.min(targetLine, mdLines.length - 1));
+-  // Convert line number to character offset in the markdown string
+-  return mdLines.slice(0, clamped).join('\n').length + (clamped > 0 ? 1 : 0);
+-}
+-
+-// Toggle source view
+-const editorWrapper = document.getElementById('editorWrapper')!;
+-document.getElementById('toggleSourceBtn')!.addEventListener('click', () => {
+-  isSourceView = !isSourceView;
+-  document.getElementById('toggleSourceBtn')!.classList.toggle('active', isSourceView);
+-  if (isSourceView) {
+-    const md = htmlToMarkdown(editor.innerHTML);
+-    const charOffset = getSourceCharOffsetForCursor(md);
+-    sourceEditor.value = md;
+-    editorWrapper.style.display = 'none';
+-    sourceContainer.style.display = 'flex';
+-    sourceEditor.focus();
+-    sourceEditor.setSelectionRange(charOffset, charOffset);
+-  } else {
+-    const md = sourceEditor.value;
+-    editor.innerHTML = markdownToHtml(md);
+-    sourceContainer.style.display = 'none';
+-    editorWrapper.style.display = 'flex';
+-    editor.focus();
+-    scheduleNavRefresh();
+-  }
+-});
+-
+-// ── Image paste handling ──
+-editor.addEventListener('paste', (e: ClipboardEvent) => {
+-  const items = e.clipboardData?.items;
+-  if (!items) return;
+-
+-  for (let i = 0; i < items.length; i++) {
+-    const item = items[i];
+-    if (item.type.startsWith('image/')) {
+-      e.preventDefault();
+-      const blob = item.getAsFile();
+-      if (!blob) continue;
+-
+-      const reader = new FileReader();
+-      reader.onload = () => {
+-        const result = reader.result as string;
+-        const base64 = result.split(',')[1];
+-        vscode.postMessage({
+-          type: 'pasteImage',
+-          data: base64,
+-          mimeType: item.type,
+-        });
+-      };
+-      reader.readAsDataURL(blob);
+-      return;
+-    }
+-  }
+-});
+-
+-// ── Image drag & drop handling ──
+-editor.addEventListener('dragover', (e: DragEvent) => {
+-  e.preventDefault();
+-  editor.classList.add('drag-over');
+-});
+-
+-editor.addEventListener('dragleave', () => {
+-  editor.classList.remove('drag-over');
+-});
+-
+-editor.addEventListener('drop', (e: DragEvent) => {
+-  e.preventDefault();
+-  editor.classList.remove('drag-over');
+-
+-  const files = e.dataTransfer?.files;
+-  if (!files || files.length === 0) return;
+-
+-  for (let i = 0; i < files.length; i++) {
+-    const file = files[i];
+-    if (file.type.startsWith('image/')) {
+-      const reader = new FileReader();
+-      reader.onload = () => {
+-        const result = reader.result as string;
+-        const base64 = result.split(',')[1];
+-        vscode.postMessage({
+-          type: 'pasteImage',
+-          data: base64,
+-          mimeType: file.type,
+-        });
+-      };
+-      reader.readAsDataURL(file);
+-    }
+-  }
+-});
+-
+-// ── Input handling ──
+-editor.addEventListener('input', () => {
+-  hasUserEdited = true;
+-  scheduleSync();
+-  scheduleNavRefresh();
+-});
+-
+-sourceEditor.addEventListener('input', () => {
+-  hasUserEdited = true;
+-  scheduleSync();
+-});
+-
+-// ── Keyboard shortcuts ──
+-editor.addEventListener('keydown', (e: KeyboardEvent) => {
+-  if (e.ctrlKey || e.metaKey) {
+-    switch (e.key.toLowerCase()) {
+-      case 'k':
+-        e.preventDefault();
+-        document.getElementById('linkBtn')!.click();
+-        break;
+-      case 's':
+-        // Let VS Code handle save
+-        break;
+-    }
+-  }
+-  // Tab in lists for indentation
+-  if (e.key === 'Tab') {
+-    const sel = window.getSelection();
+-    if (sel && sel.anchorNode) {
+-      const li = (sel.anchorNode as HTMLElement).closest?.('li') ||
+-        (sel.anchorNode.parentElement as HTMLElement)?.closest?.('li');
+-      if (li) {
+-        e.preventDefault();
+-        if (e.shiftKey) {
+-          execCmd('outdent');
+-        } else {
+-          execCmd('indent');
+-        }
+-      }
+-    }
+-  }
+-});
+-
+-// ── Message handling from extension ──
+-window.addEventListener('message', (event) => {
+-  const message = event.data;
+-  switch (message.type) {
+-    case 'update': {
+-      isUpdatingFromExtension = true;
+-      const html = markdownToHtml(message.content);
+-      if (!isSourceView) {
+-        // Preserve scroll position
+-        const scrollTop = editor.scrollTop;
+-        editor.innerHTML = html;
+-        editor.scrollTop = scrollTop;
+-      } else {
+-        sourceEditor.value = message.content;
+-      }
+-      updateWordCount(message.content);
+-      // Keep flag true briefly to catch async input events from innerHTML
+-      setTimeout(() => {
+-        isUpdatingFromExtension = false;
+-      }, 100);
+-      scheduleNavRefresh();
+-      requestSpellCheck();
+-      break;
+-    }
+-
+-    case 'loadCustomWords': {
+-      const words: string[] = message.words || [];
+-      words.forEach((w: string) => dictionary.add(w));
+-      requestSpellCheck();
+-      break;
+-    }
+-
+-    case 'imageInserted': {
+-      const imgHtml = `<img src="${escapeHtml(message.src)}" alt="${escapeHtml(message.alt)}" style="max-width: 100%;">`;
+-      if (!isSourceView) {
+-        execCmd('insertHTML', imgHtml + '<p><br></p>');
+-      } else {
+-        const mdImage = `![${message.alt}](${message.markdownPath})`;
+-        const pos = sourceEditor.selectionStart;
+-        const before = sourceEditor.value.substring(0, pos);
+-        const after = sourceEditor.value.substring(pos);
+-        sourceEditor.value = before + mdImage + after;
+-        scheduleSync();
+-      }
+-      break;
+-    }
+-  }
+-});
+-
+-// ── Utilities ──
+-function escapeHtml(text: string): string {
+-  const div = document.createElement('div');
+-  div.appendChild(document.createTextNode(text));
+-  return div.innerHTML;
+-}
+-
+-// ── Close modals on backdrop click ──
+-document.querySelectorAll('.modal').forEach((modal) => {
+-  modal.addEventListener('click', (e) => {
+-    if (e.target === modal) {
+-      (modal as HTMLElement).style.display = 'none';
+-    }
+-  });
+-});
+-
+-// ── Close modals on Escape ──
+-document.addEventListener('keydown', (e) => {
+-  if (e.key === 'Escape') {
+-    document.querySelectorAll('.modal').forEach((modal) => {
+-      (modal as HTMLElement).style.display = 'none';
+-    });
+-  }
+-});
+-
+-// ── Track heading/format state for toolbar ──
+-editor.addEventListener('keyup', updateToolbarState);
+-editor.addEventListener('mouseup', updateToolbarState);
+-
+-// ── Scroll-spy: highlight active heading in nav ──
+-editorContainer.addEventListener('scroll', () => {
+-  if (!isNavVisible) return;
+-  const headings = editor.querySelectorAll('h1, h2, h3, h4, h5, h6');
+-  const containerRect = editorContainer.getBoundingClientRect();
+-  let activeIndex = -1;
+-  headings.forEach((h, i) => {
+-    const rect = h.getBoundingClientRect();
+-    if (rect.top <= containerRect.top + 60) {
+-      activeIndex = i;
+-    }
+-  });
+-  const navItems = navList.querySelectorAll('.nav-item');
+-  navItems.forEach((item, i) => {
+-    item.classList.toggle('active', i === activeIndex);
+-  });
+-});
+-
+-function updateToolbarState() {
+-  // Update heading select
+-  const block = document.queryCommandValue('formatBlock');
+-  const headingMap: Record<string, string> = {
+-    h1: 'h1', h2: 'h2', h3: 'h3', h4: 'h4', h5: 'h5', h6: 'h6',
+-    p: 'p', div: 'p',
+-  };
+-  headingSelect.value = headingMap[block.toLowerCase()] || 'p';
+-
+-  // Highlight active formatting buttons
+-  const commands = ['bold', 'italic', 'underline', 'strikeThrough', 'superscript', 'subscript'];
+-  commands.forEach((cmd) => {
+-    const btn = document.querySelector(`.toolbar-btn[data-command="${cmd}"]`);
+-    if (btn) {
+-      btn.classList.toggle('active', document.queryCommandState(cmd));
+-    }
+-  });
+-}
+-
+-// ── Spell Check (client-side, no message round-trip) ──
+-let spellCheckTimer: ReturnType<typeof setTimeout> | null = null;
+-let currentMisspelled: Set<string> = new Set();
+-
+-function requestSpellCheck() {
+-  if (isSourceView) return;
+-  if (spellCheckTimer) clearTimeout(spellCheckTimer);
+-  spellCheckTimer = setTimeout(runSpellCheck, 300);
+-}
+-
+-function runSpellCheck() {
+-  const text = editor.innerText || '';
+-  const wordRegex = /[a-zA-Z'\u2019]+/g;
+-  const misspelled = new Set<string>();
+-  let match;
+-  while ((match = wordRegex.exec(text)) !== null) {
+-    const word = match[0].replace(/^['']+|['']+$/g, '');
+-    if (!checkWord(word)) {
+-      misspelled.add(word.toLowerCase());
+-    }
+-  }
+-  currentMisspelled = misspelled;
+-  applySpellHighlights();
+-}
+-
+-function applySpellHighlights() {
+-  // Use CSS Custom Highlight API if available
+-  if ((CSS as any).highlights) {
+-    const ranges: Range[] = [];
+-    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+-    const wordRegex = /[a-zA-Z'\u2019]+/g;
+-
+-    let node: Text | null;
+-    while ((node = walker.nextNode() as Text | null)) {
+-      const text = node.textContent || '';
+-      let match;
+-      wordRegex.lastIndex = 0;
+-      while ((match = wordRegex.exec(text)) !== null) {
+-        const word = match[0].replace(/^['']+|['']+$/g, '');
+-        if (word.length < 2) continue;
+-        if (currentMisspelled.has(word.toLowerCase())) {
+-          const range = document.createRange();
+-          range.setStart(node, match.index);
+-          range.setEnd(node, match.index + match[0].length);
+-          ranges.push(range);
+-        }
+-      }
+-    }
+-
+-    const highlight = new (window as any).Highlight(...ranges);
+-    (CSS as any).highlights.set('spelling-error', highlight);
+-  }
+-}
+-
+-// Trigger spell check on content changes
+-editor.addEventListener('input', () => {
+-  requestSpellCheck();
+-});
+-
+-// ── Custom Context Menu with Spell Suggestions ──
+-let contextMenuTarget: { node: Text; start: number; end: number; word: string } | null = null;
+-let pendingContextMenuPos = { x: 0, y: 0 };
+-
+-function getWordAtPoint(x: number, y: number): { node: Text; start: number; end: number; word: string } | null {
+-  // Try caretRangeAtPoint
+-  let range: Range | null = null;
+-  if (document.caretRangeAtPoint) {
+-    range = document.caretRangeAtPoint(x, y);
+-  }
+-  // Fallback: use current selection
+-  if (!range) {
+-    const sel = window.getSelection();
+-    if (sel && sel.rangeCount > 0) {
+-      range = sel.getRangeAt(0);
+-    }
+-  }
+-  if (!range) return null;
+-
+-  let node = range.startContainer;
+-  let offset = range.startOffset;
+-
+-  // If we landed on an element, try its text child
+-  if (node.nodeType !== Node.TEXT_NODE) {
+-    const child = node.childNodes[offset] || node.childNodes[offset - 1];
+-    if (child && child.nodeType === Node.TEXT_NODE) {
+-      node = child;
+-      offset = 0;
+-    } else {
+-      return null;
+-    }
+-  }
+-
+-  const text = node.textContent || '';
+-  const wordRegex = /[a-zA-Z'\u2019]+/g;
+-  let match;
+-  while ((match = wordRegex.exec(text)) !== null) {
+-    if (offset >= match.index && offset <= match.index + match[0].length) {
+-      const word = match[0].replace(/^['']+|['']+$/g, '');
+-      if (word.length < 2) continue;
+-      return { node: node as Text, start: match.index, end: match.index + match[0].length, word };
+-    }
+-  }
+-  return null;
+-}
+-
+-function removeContextMenu() {
+-  const existing = document.getElementById('spellContextMenu');
+-  if (existing) existing.remove();
+-}
+-
+-function showSpellContextMenu(word: string, suggestions: string[]) {
+-  removeContextMenu();
+-
+-  const menu = document.createElement('div');
+-  menu.id = 'spellContextMenu';
+-  menu.className = 'context-menu';
+-  menu.style.left = pendingContextMenuPos.x + 'px';
+-  menu.style.top = pendingContextMenuPos.y + 'px';
+-
+-  // Spelling suggestions
+-  if (suggestions.length > 0) {
+-    suggestions.forEach((suggestion) => {
+-      const item = document.createElement('button');
+-      item.className = 'context-menu-item spell-suggestion';
+-      item.textContent = suggestion;
+-      item.addEventListener('click', () => {
+-        replaceWord(suggestion);
+-        removeContextMenu();
+-      });
+-      menu.appendChild(item);
+-    });
+-  } else {
+-    const noSugg = document.createElement('div');
+-    noSugg.className = 'context-menu-item disabled';
+-    noSugg.textContent = 'No suggestions';
+-    menu.appendChild(noSugg);
+-  }
+-
+-  // Divider
+-  const divider = document.createElement('div');
+-  divider.className = 'context-menu-divider';
+-  menu.appendChild(divider);
+-
+-  // Add to dictionary option
+-  const addDict = document.createElement('button');
+-  addDict.className = 'context-menu-item';
+-  addDict.textContent = `Add "${word}" to dictionary`;
+-  addDict.addEventListener('click', () => {
+-    // Add to local dictionary and persist via extension host
+-    const lower = word.toLowerCase();
+-    currentMisspelled.delete(lower);
+-    dictionary.add(lower);
+-    vscode.postMessage({ type: 'addCustomWord', word: lower });
+-    // Re-apply highlights without this word
+-    applySpellHighlights();
+-    removeContextMenu();
+-  });
+-  menu.appendChild(addDict);
+-
+-  // Standard edit options divider
+-  const divider2 = document.createElement('div');
+-  divider2.className = 'context-menu-divider';
+-  menu.appendChild(divider2);
+-
+-  // Standard options
+-  [{ label: 'Cut', cmd: 'cut' }, { label: 'Copy', cmd: 'copy' }].forEach(({ label, cmd }) => {
+-    const item = document.createElement('button');
+-    item.className = 'context-menu-item';
+-    item.textContent = label;
+-    item.addEventListener('click', () => {
+-      document.execCommand(cmd);
+-      removeContextMenu();
+-    });
+-    menu.appendChild(item);
+-  });
+-
+-  document.body.appendChild(menu);
+-
+-  // Ensure menu doesn't overflow viewport
+-  const rect = menu.getBoundingClientRect();
+-  if (rect.right > window.innerWidth) {
+-    menu.style.left = (window.innerWidth - rect.width - 5) + 'px';
+-  }
+-  if (rect.bottom > window.innerHeight) {
+-    menu.style.top = (window.innerHeight - rect.height - 5) + 'px';
+-  }
+-}
+-
+-function replaceWord(replacement: string) {
+-  if (!contextMenuTarget) return;
+-  const { node, start, end } = contextMenuTarget;
+-  const text = node.textContent || '';
+-  node.textContent = text.slice(0, start) + replacement + text.slice(end);
+-  scheduleSync();
+-  requestSpellCheck();
+-}
+-
+-editor.addEventListener('contextmenu', (e: MouseEvent) => {
+-  removeContextMenu();
+-
+-  const target = e.target as HTMLElement;
+-
+-  // Image
+-  if (target.tagName === 'IMG') {
+-    e.preventDefault();
+-    e.stopPropagation();
+-    showImageContextMenu(target as HTMLImageElement, e.clientX, e.clientY);
+-    return;
+-  }
+-
+-  // Link
+-  const anchor = target.closest('a');
+-  if (anchor && editor.contains(anchor)) {
+-    e.preventDefault();
+-    e.stopPropagation();
+-    showLinkContextMenu(anchor as HTMLAnchorElement, e.clientX, e.clientY);
+-    return;
+-  }
+-
+-  // Table cell
+-  const tableCell = target.closest<HTMLTableCellElement>('td, th');
+-  if (tableCell && editor.contains(tableCell)) {
+-    e.preventDefault();
+-    e.stopPropagation();
+-    showTableContextMenu(tableCell, e.clientX, e.clientY);
+-    return;
+-  }
+-
+-  // Spell check
+-  const wordInfo = getWordAtPoint(e.clientX, e.clientY);
+-  if (wordInfo && currentMisspelled.has(wordInfo.word.toLowerCase())) {
+-    e.preventDefault();
+-    e.stopPropagation();
+-    contextMenuTarget = wordInfo;
+-    pendingContextMenuPos = { x: e.clientX, y: e.clientY };
+-    const suggestions = getSuggestions(wordInfo.word);
+-    showSpellContextMenu(wordInfo.word, suggestions);
+-  }
+-});
+-
+-// ── Image Context Menu ──
+-function getImageRelativePath(img: HTMLImageElement): string {
+-  const src = img.getAttribute('src') || '';
+-  const baseUri = (window as any).__baseUri as string;
+-  const attachmentsBaseUri = (window as any).__attachmentsBaseUri as string;
+-  let relativePath = src;
+-  if (baseUri && src.startsWith(baseUri + '/')) {
+-    relativePath = src.slice(baseUri.length + 1);
+-  } else if (attachmentsBaseUri && src.startsWith(attachmentsBaseUri + '/')) {
+-    relativePath = src.slice(attachmentsBaseUri.length + 1);
+-  }
+-  return relativePath;
+-}
+-
+-function showImageContextMenu(img: HTMLImageElement, x: number, y: number) {
+-  const menu = document.createElement('div');
+-  menu.id = 'spellContextMenu';
+-  menu.className = 'context-menu';
+-  menu.style.left = x + 'px';
+-  menu.style.top = y + 'px';
+-
+-  // Delete image (remove from document only)
+-  const deleteItem = document.createElement('button');
+-  deleteItem.className = 'context-menu-item';
+-  deleteItem.textContent = 'Delete Image';
+-  deleteItem.addEventListener('click', () => {
+-    img.remove();
+-    hasUserEdited = true;
+-    scheduleSync();
+-    removeContextMenu();
+-  });
+-  menu.appendChild(deleteItem);
+-
+-  // Delete image and source file
+-  const deleteWithFileItem = document.createElement('button');
+-  deleteWithFileItem.className = 'context-menu-item';
+-  deleteWithFileItem.textContent = 'Delete Image and Source';
+-  deleteWithFileItem.addEventListener('click', () => {
+-    const relativePath = getImageRelativePath(img);
+-    img.remove();
+-    hasUserEdited = true;
+-    scheduleSync();
+-    vscode.postMessage({ type: 'deleteImage', relativePath });
+-    removeContextMenu();
+-  });
+-  menu.appendChild(deleteWithFileItem);
+-
+-  document.body.appendChild(menu);
+-
+-  // Ensure menu doesn't overflow viewport
+-  const rect = menu.getBoundingClientRect();
+-  if (rect.right > window.innerWidth) {
+-    menu.style.left = (window.innerWidth - rect.width - 5) + 'px';
+-  }
+-  if (rect.bottom > window.innerHeight) {
+-    menu.style.top = (window.innerHeight - rect.height - 5) + 'px';
+-  }
+-}
+-
+-// ── Link Context Menu ──
+-function showLinkContextMenu(anchor: HTMLAnchorElement, x: number, y: number) {
+-  const menu = document.createElement('div');
+-  menu.id = 'spellContextMenu';
+-  menu.className = 'context-menu';
+-  menu.style.left = x + 'px';
+-  menu.style.top = y + 'px';
+-
+-  const editItem = document.createElement('button');
+-  editItem.className = 'context-menu-item';
+-  editItem.textContent = 'Edit Link';
+-  editItem.addEventListener('click', () => {
+-    editingLinkElement = anchor;
+-    (document.getElementById('linkUrl') as HTMLInputElement).value = anchor.getAttribute('href') || '';
+-    (document.getElementById('linkText') as HTMLInputElement).value = anchor.textContent || '';
+-    (document.getElementById('linkTitle') as HTMLInputElement).value = anchor.title || '';
+-    (document.getElementById('linkNewTab') as HTMLInputElement).checked = anchor.target === '_blank';
+-    document.getElementById('linkModal')!.style.display = 'flex';
+-    (document.getElementById('linkUrl') as HTMLInputElement).focus();
+-    removeContextMenu();
+-  });
+-  menu.appendChild(editItem);
+-
+-  const copyItem = document.createElement('button');
+-  copyItem.className = 'context-menu-item';
+-  copyItem.textContent = 'Copy Link URL';
+-  copyItem.addEventListener('click', () => {
+-    navigator.clipboard.writeText(anchor.getAttribute('href') || '').catch(() => {});
+-    removeContextMenu();
+-  });
+-  menu.appendChild(copyItem);
+-
+-  const linkDivider = document.createElement('div');
+-  linkDivider.className = 'context-menu-divider';
+-  menu.appendChild(linkDivider);
+-
+-  const removeItem = document.createElement('button');
+-  removeItem.className = 'context-menu-item';
+-  removeItem.textContent = 'Remove Link';
+-  removeItem.addEventListener('click', () => {
+-    const text = document.createTextNode(anchor.textContent || '');
+-    anchor.parentNode?.replaceChild(text, anchor);
+-    hasUserEdited = true;
+-    scheduleSync();
+-    removeContextMenu();
+-  });
+-  menu.appendChild(removeItem);
+-
+-  document.body.appendChild(menu);
+-  const lr = menu.getBoundingClientRect();
+-  if (lr.right > window.innerWidth) menu.style.left = (window.innerWidth - lr.width - 5) + 'px';
+-  if (lr.bottom > window.innerHeight) menu.style.top = (window.innerHeight - lr.height - 5) + 'px';
+-}
+-
+-// ── Table Context Menu ──
+-function showTableContextMenu(cell: HTMLTableCellElement, x: number, y: number) {
+-  const row = cell.parentElement as HTMLTableRowElement;
+-  const table = cell.closest('table') as HTMLTableElement;
+-  if (!table) return;
+-  const colIndex = Array.from(row.cells).indexOf(cell);
+-
+-  const menu = document.createElement('div');
+-  menu.id = 'spellContextMenu';
+-  menu.className = 'context-menu';
+-  menu.style.left = x + 'px';
+-  menu.style.top = y + 'px';
+-
+-  const tableActions: Array<{ label: string; fn: () => void }> = [
+-    {
+-      label: 'Add Row Above',
+-      fn: () => {
+-        const newRow = row.cloneNode(true) as HTMLTableRowElement;
+-        Array.from(newRow.cells).forEach(c => { c.innerHTML = '&nbsp;'; });
+-        row.parentNode!.insertBefore(newRow, row);
+-      },
+-    },
+-    {
+-      label: 'Add Row Below',
+-      fn: () => {
+-        const newRow = row.cloneNode(true) as HTMLTableRowElement;
+-        Array.from(newRow.cells).forEach(c => { c.innerHTML = '&nbsp;'; });
+-        row.parentNode!.insertBefore(newRow, row.nextSibling);
+-      },
+-    },
+-    {
+-      label: 'Add Column Left',
+-      fn: () => {
+-        Array.from(table.rows).forEach(r => {
+-          const ref = r.cells[colIndex];
+-          if (ref) {
+-            const newCell = document.createElement(ref.tagName.toLowerCase());
+-            newCell.innerHTML = '&nbsp;';
+-            ref.parentNode!.insertBefore(newCell, ref);
+-          }
+-        });
+-      },
+-    },
+-    {
+-      label: 'Add Column Right',
+-      fn: () => {
+-        Array.from(table.rows).forEach(r => {
+-          const ref = r.cells[colIndex];
+-          if (ref) {
+-            const newCell = document.createElement(ref.tagName.toLowerCase());
+-            newCell.innerHTML = '&nbsp;';
+-            ref.parentNode!.insertBefore(newCell, ref.nextSibling);
+-          }
+-        });
+-      },
+-    },
+-  ];
+-
+-  tableActions.forEach(({ label, fn }) => {
+-    const item = document.createElement('button');
+-    item.className = 'context-menu-item';
+-    item.textContent = label;
+-    item.addEventListener('click', () => { fn(); hasUserEdited = true; scheduleSync(); removeContextMenu(); });
+-    menu.appendChild(item);
+-  });
+-
+-  const td1 = document.createElement('div');
+-  td1.className = 'context-menu-divider';
+-  menu.appendChild(td1);
+-
+-  const delRow = document.createElement('button');
+-  delRow.className = 'context-menu-item';
+-  delRow.textContent = 'Delete Row';
+-  delRow.addEventListener('click', () => {
+-    if (table.rows.length > 1) row.remove(); else table.remove();
+-    hasUserEdited = true; scheduleSync(); removeContextMenu();
+-  });
+-  menu.appendChild(delRow);
+-
+-  const delCol = document.createElement('button');
+-  delCol.className = 'context-menu-item';
+-  delCol.textContent = 'Delete Column';
+-  delCol.addEventListener('click', () => {
+-    if (row.cells.length > 1) {
+-      Array.from(table.rows).forEach(r => { if (r.cells[colIndex]) r.deleteCell(colIndex); });
+-    } else {
+-      table.remove();
+-    }
+-    hasUserEdited = true; scheduleSync(); removeContextMenu();
+-  });
+-  menu.appendChild(delCol);
+-
+-  const td2 = document.createElement('div');
+-  td2.className = 'context-menu-divider';
+-  menu.appendChild(td2);
+-
+-  const delTable = document.createElement('button');
+-  delTable.className = 'context-menu-item';
+-  delTable.textContent = 'Delete Table';
+-  delTable.addEventListener('click', () => {
+-    table.remove();
+-    hasUserEdited = true; scheduleSync(); removeContextMenu();
+-  });
+-  menu.appendChild(delTable);
+-
+-  document.body.appendChild(menu);
+-  const tr = menu.getBoundingClientRect();
+-  if (tr.right > window.innerWidth) menu.style.left = (window.innerWidth - tr.width - 5) + 'px';
+-  if (tr.bottom > window.innerHeight) menu.style.top = (window.innerHeight - tr.height - 5) + 'px';
+-}
+-
+-// Close context menu on click elsewhere
+-document.addEventListener('click', (e) => {
+-  const menu = document.getElementById('spellContextMenu');
+-  if (menu && !menu.contains(e.target as Node)) {
+-    removeContextMenu();
+-  }
+-});
+-
+-document.addEventListener('keydown', (e) => {
+-  if (e.key === 'Escape') {
+-    removeContextMenu();
+-  }
+-});
+-
+-// ── Cursor position tracking ──
+-document.addEventListener('selectionchange', () => {
+-  if (isSourceView) return;
+-  const cursorEl = document.getElementById('cursorPosition');
+-  if (!cursorEl) return;
+-  const sel = window.getSelection();
+-  if (!sel || !sel.rangeCount) { cursorEl.textContent = ''; return; }
+-  const range = sel.getRangeAt(0);
+-  if (!editor.contains(range.startContainer)) { cursorEl.textContent = ''; return; }
+-  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+-  let text = '';
+-  let node: Node | null;
+-  while ((node = walker.nextNode())) {
+-    if (node === range.startContainer) { text += (node.textContent ?? '').slice(0, range.startOffset); break; }
+-    text += node.textContent ?? '';
+-  }
+-  const lines = text.split('\n');
+-  cursorEl.textContent = `Ln ${lines.length}, Col ${lines[lines.length - 1].length + 1}`;
+-});
+-
+-// ── Image hover tooltip ──
+-const imgTooltip = document.createElement('div');
+-imgTooltip.id = 'imgTooltip';
+-imgTooltip.className = 'img-tooltip';
+-document.body.appendChild(imgTooltip);
+-
+-let imgTooltipTimer: ReturnType<typeof setTimeout> | null = null;
+-let tooltipImg: HTMLImageElement | null = null;
+-
+-function showImgTooltip(img: HTMLImageElement, x: number, y: number) {
+-  const relativePath = getImageRelativePath(img);
+-  const filename = relativePath.replace(/\\/g, '/').split('/').pop() || relativePath;
+-  imgTooltip.textContent = filename;
+-  imgTooltip.style.display = 'block';
+-  // Position below-right of cursor, keeping within viewport
+-  const offset = 14;
+-  imgTooltip.style.left = (x + offset) + 'px';
+-  imgTooltip.style.top = (y + offset) + 'px';
+-  requestAnimationFrame(() => {
+-    const rect = imgTooltip.getBoundingClientRect();
+-    if (rect.right > window.innerWidth - 8) {
+-      imgTooltip.style.left = (x - rect.width - offset) + 'px';
+-    }
+-    if (rect.bottom > window.innerHeight - 8) {
+-      imgTooltip.style.top = (y - rect.height - offset) + 'px';
+-    }
+-  });
+-}
+-
+-function hideImgTooltip() {
+-  imgTooltip.style.display = 'none';
+-  if (imgTooltipTimer) { clearTimeout(imgTooltipTimer); imgTooltipTimer = null; }
+-  tooltipImg = null;
+-}
+-
+-editor.addEventListener('mousemove', (e: MouseEvent) => {
+-  const target = e.target as HTMLElement;
+-  if (target.tagName === 'IMG') {
+-    const img = target as HTMLImageElement;
+-    if (tooltipImg !== img) {
+-      hideImgTooltip();
+-      tooltipImg = img;
+-    }
+-    if (imgTooltipTimer) clearTimeout(imgTooltipTimer);
+-    const cx = e.clientX;
+-    const cy = e.clientY;
+-    imgTooltipTimer = setTimeout(() => showImgTooltip(img, cx, cy), 700);
+-  } else {
+-    if (tooltipImg) hideImgTooltip();
+-  }
+-});
+-
+-editor.addEventListener('mouseleave', () => {
+-  hideImgTooltip();
+-});
+-
+-// ── Notify extension we're ready ──
+-vscode.postMessage({ type: 'ready' });
++// Wire up every feature. Order matters in a few places:
++//   - Input handlers must come last among editor-listener registrations so
++//     they don't double-handle events wired by other features.
++//   - Outline must init before messages, because the 'update' handler calls
++//     scheduleNavRefresh().
++initToolbar();
++initColors();
++initInsert();
++initOutline();
++initImageTransfer();
++initZoom();
++initImageTooltip();
++initModals();
++initContextMenus();
++initCursorTracking();
++initMessages();
++initInput();
++initTextEditorToggle();
++
++// Tell the extension host we're ready to receive the initial document.
++postMessage({ type: 'ready' });
+diff --git a/src/webview/features/colors.ts b/src/webview/features/colors.ts
+new file mode 100644
+index 0000000..516f4dd
+--- /dev/null
++++ b/src/webview/features/colors.ts
+@@ -0,0 +1,168 @@
++// Color palette UI: preset swatches, recent-colors tracking (persisted in
++// localStorage), and wiring for text-color + background-color dropdowns.
++
++import { state } from '../state';
++import { execCmd } from '../sync';
++
++const PRESET_COLORS = [
++  '#000000', '#434343', '#666666', '#999999', '#cccccc', '#ffffff',
++  '#ff0000', '#ff8c00', '#ffdd00', '#00b050', '#0070c0', '#7030a0',
++  '#c00000', '#e36c09', '#bf9000', '#00823b', '#004080', '#4a1a6b',
++];
++
++const MAX_RECENT_COLORS = 6;
++
++function addRecentColor(color: string): void {
++  const normalized = color.toLowerCase();
++  state.recentColors = state.recentColors.filter(c => c !== normalized);
++  state.recentColors.unshift(normalized);
++  if (state.recentColors.length > MAX_RECENT_COLORS) {
++    state.recentColors = state.recentColors.slice(0, MAX_RECENT_COLORS);
++  }
++  localStorage.setItem('recentColors', JSON.stringify(state.recentColors));
++  // Refresh all recent color rows
++  document.querySelectorAll('.recent-colors-row').forEach(row => renderRecentRow(row as HTMLElement));
++}
++
++function renderRecentRow(row: HTMLElement): void {
++  const onPick = (row as any)._onPick as (color: string) => void;
++  row.innerHTML = '';
++  if (state.recentColors.length === 0) {
++    row.style.display = 'none';
++    const sep = row.previousElementSibling;
++    if (sep?.classList.contains('recent-colors-separator')) (sep as HTMLElement).style.display = 'none';
++    return;
++  }
++  row.style.display = 'grid';
++  const sep = row.previousElementSibling;
++  if (sep?.classList.contains('recent-colors-separator')) (sep as HTMLElement).style.display = '';
++  state.recentColors.forEach((color) => {
++    const swatch = document.createElement('button');
++    swatch.className = 'color-swatch';
++    swatch.style.background = color;
++    if (color === '#ffffff') swatch.style.borderColor = '#ccc';
++    swatch.title = color;
++    swatch.addEventListener('click', (e) => {
++      e.stopPropagation();
++      onPick(color);
++    });
++    row.appendChild(swatch);
++  });
++}
++
++function buildSwatches(containerId: string, onPick: (color: string) => void, onClear: () => void): void {
++  const container = document.getElementById(containerId)!;
++
++  // "None" swatch to remove color
++  const noneSwatch = document.createElement('button');
++  noneSwatch.className = 'color-swatch color-swatch-none';
++  noneSwatch.title = 'None (remove color)';
++  noneSwatch.innerHTML = '&#x2715;';
++  noneSwatch.addEventListener('click', (e) => {
++    e.stopPropagation();
++    closeAllColorDropdowns();
++    onClear();
++  });
++  container.appendChild(noneSwatch);
++
++  PRESET_COLORS.forEach((color) => {
++    const swatch = document.createElement('button');
++    swatch.className = 'color-swatch';
++    swatch.style.background = color;
++    if (color === '#ffffff') swatch.style.borderColor = '#ccc';
++    swatch.title = color;
++    swatch.addEventListener('click', (e) => {
++      e.stopPropagation();
++      addRecentColor(color);
++      onPick(color);
++    });
++    container.appendChild(swatch);
++  });
++
++  // Recent colors separator and row — append after the grid container
++  const parent = container.parentElement!;
++  const separator = document.createElement('div');
++  separator.className = 'recent-colors-separator';
++  separator.innerHTML = '<span>Recent</span>';
++  parent.insertBefore(separator, container.nextSibling);
++
++  const recentRow = document.createElement('div');
++  recentRow.className = 'recent-colors-row';
++  (recentRow as any)._onPick = (color: string) => {
++    addRecentColor(color);
++    onPick(color);
++  };
++  parent.insertBefore(recentRow, separator.nextSibling);
++  renderRecentRow(recentRow);
++}
++
++function closeAllColorDropdowns(): void {
++  document.querySelectorAll('.color-dropdown').forEach((d) => d.classList.remove('open'));
++}
++
++export function initColors(): void {
++  // Text color
++  const textColorPicker = document.getElementById('textColorPicker') as HTMLInputElement;
++  const textColorBtn = document.getElementById('textColorBtn')!;
++  const textColorDropdown = document.getElementById('textColorDropdown')!;
++
++  function applyTextColor(color: string) {
++    textColorPicker.value = color;
++    textColorBtn.style.borderBottomColor = color;
++    closeAllColorDropdowns();
++    execCmd('foreColor', color);
++  }
++
++  textColorBtn.addEventListener('click', (e) => {
++    e.stopPropagation();
++    const isOpen = textColorDropdown.classList.contains('open');
++    closeAllColorDropdowns();
++    if (!isOpen) textColorDropdown.classList.add('open');
++  });
++
++  textColorPicker.addEventListener('input', () => {
++    addRecentColor(textColorPicker.value);
++    applyTextColor(textColorPicker.value);
++  });
++  buildSwatches('textColorSwatches', applyTextColor, () => {
++    textColorBtn.style.borderBottomColor = 'transparent';
++    closeAllColorDropdowns();
++    execCmd('removeFormat');
++  });
++
++  // Background color
++  const bgColorPicker = document.getElementById('bgColorPicker') as HTMLInputElement;
++  const bgColorBtn = document.getElementById('bgColorBtn')!;
++  const bgColorDropdown = document.getElementById('bgColorDropdown')!;
++
++  function applyBgColor(color: string) {
++    bgColorPicker.value = color;
++    bgColorBtn.style.borderBottomColor = color;
++    const indicator = bgColorBtn.querySelector('span') as HTMLElement;
++    if (indicator) indicator.style.background = color;
++    closeAllColorDropdowns();
++    execCmd('hiliteColor', color);
++  }
++
++  bgColorBtn.addEventListener('click', (e) => {
++    e.stopPropagation();
++    const isOpen = bgColorDropdown.classList.contains('open');
++    closeAllColorDropdowns();
++    if (!isOpen) bgColorDropdown.classList.add('open');
++  });
++
++  bgColorPicker.addEventListener('input', () => {
++    addRecentColor(bgColorPicker.value);
++    applyBgColor(bgColorPicker.value);
++  });
++  buildSwatches('bgColorSwatches', applyBgColor, () => {
++    bgColorBtn.style.borderBottomColor = 'transparent';
++    const indicator = bgColorBtn.querySelector('span') as HTMLElement;
++    if (indicator) indicator.style.background = 'transparent';
++    closeAllColorDropdowns();
++    execCmd('hiliteColor', 'transparent');
++  });
++
++  // Close color dropdowns on outside click
++  document.addEventListener('click', () => closeAllColorDropdowns());
++}
+diff --git a/src/webview/features/contextMenus.ts b/src/webview/features/contextMenus.ts
+new file mode 100644
+index 0000000..ee178ce
+--- /dev/null
++++ b/src/webview/features/contextMenus.ts
+@@ -0,0 +1,409 @@
++// Right-click context menus for the editor:
++//   - Misspelled word: show suggestions, add to dictionary, cut/copy
++//   - Image: delete from doc, delete from doc + file
++//   - Link: edit, copy URL, remove
++//   - Table cell: insert/delete rows/columns/whole table
++//
++// The dispatcher lives on `editor.contextmenu`. Each menu is a detached
++// `<div class="context-menu">` appended to <body>; only one is ever visible.
++
++import { state, editor } from '../state';
++import { scheduleSync, execCmd } from '../sync';
++import { escapeHtml, clampToViewport } from '../utils';
++import { getSuggestions, addCustomWord, replaceWordAt } from '../spellcheck';
++import { postMessage } from '../vscodeApi';
++
++interface WebviewWindow extends Window {
++  __baseUri?: string;
++  __attachmentsBaseUri?: string;
++}
++
++function getWebviewWindow(): WebviewWindow {
++  return window as unknown as WebviewWindow;
++}
++
++export function removeContextMenu(): void {
++  const existing = document.getElementById('spellContextMenu');
++  if (existing) existing.remove();
++}
++
++/** Resolve an <img src="..."> (which may be a webview URI) back to a relative path. */
++export function getImageRelativePath(img: HTMLImageElement): string {
++  const src = img.getAttribute('src') || '';
++  const w = getWebviewWindow();
++  const baseUri = w.__baseUri;
++  const attachmentsBaseUri = w.__attachmentsBaseUri;
++  let relativePath = src;
++
++  if (baseUri && src.startsWith(baseUri + '/')) {
++    relativePath = src.slice(baseUri.length + 1);
++  } else if (attachmentsBaseUri && src.startsWith(attachmentsBaseUri + '/')) {
++    relativePath = src.slice(attachmentsBaseUri.length + 1);
++  }
++  return relativePath;
++}
++
++function getWordAtPoint(x: number, y: number): { node: Text; start: number; end: number; word: string } | null {
++  // Try caretRangeAtPoint
++  let range: Range | null = null;
++  if (document.caretRangeAtPoint) {
++    range = document.caretRangeAtPoint(x, y);
++  }
++  // Fallback: use current selection
++  if (!range) {
++    const sel = window.getSelection();
++    if (sel && sel.rangeCount > 0) {
++      range = sel.getRangeAt(0);
++    }
++  }
++  if (!range) return null;
++
++  let node = range.startContainer;
++  let offset = range.startOffset;
++
++  // If we landed on an element, try its text child
++  if (node.nodeType !== Node.TEXT_NODE) {
++    const child = node.childNodes[offset] || node.childNodes[offset - 1];
++    if (child && child.nodeType === Node.TEXT_NODE) {
++      node = child;
++      offset = 0;
++    } else {
++      return null;
++    }
++  }
++
++  const text = node.textContent || '';
++  const wordRegex = /[a-zA-Z'\u2019]+/g;
++  let match;
++  while ((match = wordRegex.exec(text)) !== null) {
++    if (offset >= match.index && offset <= match.index + match[0].length) {
++      const word = match[0].replace(/^['']+|['']+$/g, '');
++      if (word.length < 2) continue;
++      return { node: node as Text, start: match.index, end: match.index + match[0].length, word };
++    }
++  }
++  return null;
++}
++
++function showSpellContextMenu(word: string, suggestions: string[]): void {
++  removeContextMenu();
++
++  const menu = document.createElement('div');
++  menu.id = 'spellContextMenu';
++  menu.className = 'context-menu';
++  menu.style.left = state.pendingContextMenuPos.x + 'px';
++  menu.style.top = state.pendingContextMenuPos.y + 'px';
++
++  // Spelling suggestions
++  if (suggestions.length > 0) {
++    suggestions.forEach((suggestion) => {
++      const item = document.createElement('button');
++      item.className = 'context-menu-item spell-suggestion';
++      item.textContent = suggestion;
++      item.addEventListener('click', () => {
++        replaceWordAt(suggestion);
++        removeContextMenu();
++      });
++      menu.appendChild(item);
++    });
++  } else {
++    const noSugg = document.createElement('div');
++    noSugg.className = 'context-menu-item disabled';
++    noSugg.textContent = 'No suggestions';
++    menu.appendChild(noSugg);
++  }
++
++  // Divider
++  const divider = document.createElement('div');
++  divider.className = 'context-menu-divider';
++  menu.appendChild(divider);
++
++  // Add to dictionary option
++  const addDict = document.createElement('button');
++  addDict.className = 'context-menu-item';
++  addDict.textContent = `Add "${word}" to dictionary`;
++  addDict.addEventListener('click', () => {
++    addCustomWord(word);
++    removeContextMenu();
++  });
++  menu.appendChild(addDict);
++
++  // Standard edit options divider
++  const divider2 = document.createElement('div');
++  divider2.className = 'context-menu-divider';
++  menu.appendChild(divider2);
++
++  // Standard options
++  [{ label: 'Cut', cmd: 'cut' }, { label: 'Copy', cmd: 'copy' }].forEach(({ label, cmd }) => {
++    const item = document.createElement('button');
++    item.className = 'context-menu-item';
++    item.textContent = label;
++    item.addEventListener('click', () => {
++      document.execCommand(cmd);
++      removeContextMenu();
++    });
++    menu.appendChild(item);
++  });
++
++  document.body.appendChild(menu);
++  clampToViewport(menu);
++}
++
++function showImageContextMenu(img: HTMLImageElement, x: number, y: number): void {
++  const menu = document.createElement('div');
++  menu.id = 'spellContextMenu';
++  menu.className = 'context-menu';
++  menu.style.left = x + 'px';
++  menu.style.top = y + 'px';
++
++  // Delete image (remove from document only)
++  const deleteItem = document.createElement('button');
++  deleteItem.className = 'context-menu-item';
++  deleteItem.textContent = 'Delete Image';
++  deleteItem.addEventListener('click', () => {
++    img.remove();
++    state.hasUserEdited = true;
++    scheduleSync();
++    removeContextMenu();
++  });
++  menu.appendChild(deleteItem);
++
++  // Delete image and source file
++  const deleteWithFileItem = document.createElement('button');
++  deleteWithFileItem.className = 'context-menu-item';
++  deleteWithFileItem.textContent = 'Delete Image and Source';
++  deleteWithFileItem.addEventListener('click', () => {
++    const relativePath = getImageRelativePath(img);
++    img.remove();
++    state.hasUserEdited = true;
++    scheduleSync();
++    postMessage({ type: 'deleteImage', relativePath });
++    removeContextMenu();
++  });
++  menu.appendChild(deleteWithFileItem);
++
++  document.body.appendChild(menu);
++  clampToViewport(menu);
++}
++
++function showLinkContextMenu(anchor: HTMLAnchorElement, x: number, y: number): void {
++  const menu = document.createElement('div');
++  menu.id = 'spellContextMenu';
++  menu.className = 'context-menu';
++  menu.style.left = x + 'px';
++  menu.style.top = y + 'px';
++
++  const editItem = document.createElement('button');
++  editItem.className = 'context-menu-item';
++  editItem.textContent = 'Edit Link';
++  editItem.addEventListener('click', () => {
++    state.editingLinkElement = anchor;
++    (document.getElementById('linkUrl') as HTMLInputElement).value = anchor.getAttribute('href') || '';
++    (document.getElementById('linkText') as HTMLInputElement).value = anchor.textContent || '';
++    (document.getElementById('linkTitle') as HTMLInputElement).value = anchor.title || '';
++    (document.getElementById('linkNewTab') as HTMLInputElement).checked = anchor.target === '_blank';
++    document.getElementById('linkModal')!.style.display = 'flex';
++    (document.getElementById('linkUrl') as HTMLInputElement).focus();
++    removeContextMenu();
++  });
++  menu.appendChild(editItem);
++
++  const copyItem = document.createElement('button');
++  copyItem.className = 'context-menu-item';
++  copyItem.textContent = 'Copy Link URL';
++  copyItem.addEventListener('click', () => {
++    navigator.clipboard.writeText(anchor.getAttribute('href') || '').catch(() => {});
++    removeContextMenu();
++  });
++  menu.appendChild(copyItem);
++
++  const linkDivider = document.createElement('div');
++  linkDivider.className = 'context-menu-divider';
++  menu.appendChild(linkDivider);
++
++  const removeItem = document.createElement('button');
++  removeItem.className = 'context-menu-item';
++  removeItem.textContent = 'Remove Link';
++  removeItem.addEventListener('click', () => {
++    const text = document.createTextNode(anchor.textContent || '');
++    anchor.parentNode?.replaceChild(text, anchor);
++    state.hasUserEdited = true;
++    scheduleSync();
++    removeContextMenu();
++  });
++  menu.appendChild(removeItem);
++
++  document.body.appendChild(menu);
++  clampToViewport(menu);
++}
++
++function showTableContextMenu(cell: HTMLTableCellElement, x: number, y: number): void {
++  const row = cell.parentElement as HTMLTableRowElement;
++  const table = cell.closest('table') as HTMLTableElement;
++  if (!table) return;
++  const colIndex = Array.from(row.cells).indexOf(cell);
++
++  const menu = document.createElement('div');
++  menu.id = 'spellContextMenu';
++  menu.className = 'context-menu';
++  menu.style.left = x + 'px';
++  menu.style.top = y + 'px';
++
++  const tableActions: Array<{ label: string; fn: () => void }> = [
++    {
++      label: 'Add Row Above',
++      fn: () => {
++        const newRow = row.cloneNode(true) as HTMLTableRowElement;
++        Array.from(newRow.cells).forEach(c => { c.innerHTML = '&nbsp;'; });
++        row.parentNode!.insertBefore(newRow, row);
++      },
++    },
++    {
++      label: 'Add Row Below',
++      fn: () => {
++        const newRow = row.cloneNode(true) as HTMLTableRowElement;
++        Array.from(newRow.cells).forEach(c => { c.innerHTML = '&nbsp;'; });
++        row.parentNode!.insertBefore(newRow, row.nextSibling);
++      },
++    },
++    {
++      label: 'Add Column Left',
++      fn: () => {
++        Array.from(table.rows).forEach(r => {
++          const ref = r.cells[colIndex];
++          if (ref) {
++            const newCell = document.createElement(ref.tagName.toLowerCase());
++            newCell.innerHTML = '&nbsp;';
++            ref.parentNode!.insertBefore(newCell, ref);
++          }
++        });
++      },
++    },
++    {
++      label: 'Add Column Right',
++      fn: () => {
++        Array.from(table.rows).forEach(r => {
++          const ref = r.cells[colIndex];
++          if (ref) {
++            const newCell = document.createElement(ref.tagName.toLowerCase());
++            newCell.innerHTML = '&nbsp;';
++            ref.parentNode!.insertBefore(newCell, ref.nextSibling);
++          }
++        });
++      },
++    },
++  ];
++
++  tableActions.forEach(({ label, fn }) => {
++    const item = document.createElement('button');
++    item.className = 'context-menu-item';
++    item.textContent = label;
++    item.addEventListener('click', () => { fn(); state.hasUserEdited = true; scheduleSync(); removeContextMenu(); });
++    menu.appendChild(item);
++  });
++
++  const td1 = document.createElement('div');
++  td1.className = 'context-menu-divider';
++  menu.appendChild(td1);
++
++  const delRow = document.createElement('button');
++  delRow.className = 'context-menu-item';
++  delRow.textContent = 'Delete Row';
++  delRow.addEventListener('click', () => {
++    if (table.rows.length > 1) row.remove(); else table.remove();
++    state.hasUserEdited = true; scheduleSync(); removeContextMenu();
++  });
++  menu.appendChild(delRow);
++
++  const delCol = document.createElement('button');
++  delCol.className = 'context-menu-item';
++  delCol.textContent = 'Delete Column';
++  delCol.addEventListener('click', () => {
++    if (row.cells.length > 1) {
++      Array.from(table.rows).forEach(r => { if (r.cells[colIndex]) r.deleteCell(colIndex); });
++    } else {
++      table.remove();
++    }
++    state.hasUserEdited = true; scheduleSync(); removeContextMenu();
++  });
++  menu.appendChild(delCol);
++
++  const td2 = document.createElement('div');
++  td2.className = 'context-menu-divider';
++  menu.appendChild(td2);
++
++  const delTable = document.createElement('button');
++  delTable.className = 'context-menu-item';
++  delTable.textContent = 'Delete Table';
++  delTable.addEventListener('click', () => {
++    table.remove();
++    state.hasUserEdited = true; scheduleSync(); removeContextMenu();
++  });
++  menu.appendChild(delTable);
++
++  document.body.appendChild(menu);
++  clampToViewport(menu);
++}
++
++export function initContextMenus(): void {
++  editor.addEventListener('contextmenu', (e: MouseEvent) => {
++    removeContextMenu();
++
++    const target = e.target as HTMLElement;
++
++    // Image
++    if (target.tagName === 'IMG') {
++      e.preventDefault();
++      e.stopPropagation();
++      showImageContextMenu(target as HTMLImageElement, e.clientX, e.clientY);
++      return;
++    }
++
++    // Link
++    const anchor = target.closest('a');
++    if (anchor && editor.contains(anchor)) {
++      e.preventDefault();
++      e.stopPropagation();
++      showLinkContextMenu(anchor as HTMLAnchorElement, e.clientX, e.clientY);
++      return;
++    }
++
++    // Table cell
++    const tableCell = target.closest<HTMLTableCellElement>('td, th');
++    if (tableCell && editor.contains(tableCell)) {
++      e.preventDefault();
++      e.stopPropagation();
++      showTableContextMenu(tableCell, e.clientX, e.clientY);
++      return;
++    }
++
++    // Spell check
++    const wordInfo = getWordAtPoint(e.clientX, e.clientY);
++    if (wordInfo && state.currentMisspelled.has(wordInfo.word.toLowerCase())) {
++      e.preventDefault();
++      e.stopPropagation();
++      state.contextMenuTarget = wordInfo;
++      state.pendingContextMenuPos = { x: e.clientX, y: e.clientY };
++      const suggestions = getSuggestions(wordInfo.word);
++      showSpellContextMenu(wordInfo.word, suggestions);
++    }
++  });
++
++  // Close context menu on click elsewhere
++  document.addEventListener('click', (e) => {
++    const menu = document.getElementById('spellContextMenu');
++    if (menu && !menu.contains(e.target as Node)) {
++      removeContextMenu();
++    }
++  });
++
++  document.addEventListener('keydown', (e) => {
++    if (e.key === 'Escape') {
++      removeContextMenu();
++    }
++  });
++}
++
++// Re-export escapeHtml so callers that imported it from this module before
++// the split still resolve. (Not strictly necessary but harmless.)
++export { escapeHtml, execCmd };
+diff --git a/src/webview/features/cursorTracking.ts b/src/webview/features/cursorTracking.ts
+new file mode 100644
+index 0000000..0307ce4
+--- /dev/null
++++ b/src/webview/features/cursorTracking.ts
+@@ -0,0 +1,30 @@
++// Cursor position tracking — updates the "Ln X, Col Y" status-bar readout on
++// every selection change inside the editor.
++//
++// (The previous source-view toggle was removed in favour of swapping to VS
++// Code's built-in Text Editor via the `visualMarkdownEditor.toggleTextEditor`
++// command — that gives users real syntax highlighting, multi-cursor,
++// Copilot Chat support, etc. for raw markdown editing.)
++
++import { state, editor } from '../state';
++
++/** Update the "Ln X, Col Y" status-bar readout on every selection change. */
++export function initCursorTracking(): void {
++  document.addEventListener('selectionchange', () => {
++    const cursorEl = document.getElementById('cursorPosition');
++    if (!cursorEl) return;
++    const sel = window.getSelection();
++    if (!sel || !sel.rangeCount) { cursorEl.textContent = ''; return; }
++    const range = sel.getRangeAt(0);
++    if (!editor.contains(range.startContainer)) { cursorEl.textContent = ''; return; }
++    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
++    let text = '';
++    let node: Node | null;
++    while ((node = walker.nextNode())) {
++      if (node === range.startContainer) { text += (node.textContent ?? '').slice(0, range.startOffset); break; }
++      text += node.textContent ?? '';
++    }
++    const lines = text.split('\n');
++    cursorEl.textContent = `Ln ${lines.length}, Col ${lines[lines.length - 1].length + 1}`;
++  });
++}
+diff --git a/src/webview/features/imageTooltip.ts b/src/webview/features/imageTooltip.ts
+new file mode 100644
+index 0000000..98a484e
+--- /dev/null
++++ b/src/webview/features/imageTooltip.ts
+@@ -0,0 +1,59 @@
++// Image hover tooltip. Shows the image's relative filename after a 700ms
++// dwell time.
++
++import { state, editor } from '../state';
++import { getImageRelativePath } from './contextMenus';
++
++const imgTooltip = document.createElement('div');
++imgTooltip.id = 'imgTooltip';
++imgTooltip.className = 'img-tooltip';
++document.body.appendChild(imgTooltip);
++
++function showImgTooltip(img: HTMLImageElement, x: number, y: number): void {
++  const relativePath = getImageRelativePath(img);
++  const filename = relativePath.replace(/\\/g, '/').split('/').pop() || relativePath;
++  imgTooltip.textContent = filename;
++  imgTooltip.style.display = 'block';
++  // Position below-right of cursor, keeping within viewport
++  const offset = 14;
++  imgTooltip.style.left = (x + offset) + 'px';
++  imgTooltip.style.top = (y + offset) + 'px';
++  requestAnimationFrame(() => {
++    const rect = imgTooltip.getBoundingClientRect();
++    if (rect.right > window.innerWidth - 8) {
++      imgTooltip.style.left = (x - rect.width - offset) + 'px';
++    }
++    if (rect.bottom > window.innerHeight - 8) {
++      imgTooltip.style.top = (y - rect.height - offset) + 'px';
++    }
++  });
++}
++
++function hideImgTooltip(): void {
++  imgTooltip.style.display = 'none';
++  if (state.imgTooltipTimer) { clearTimeout(state.imgTooltipTimer); state.imgTooltipTimer = null; }
++  state.tooltipImg = null;
++}
++
++export function initImageTooltip(): void {
++  editor.addEventListener('mousemove', (e: MouseEvent) => {
++    const target = e.target as HTMLElement;
++    if (target.tagName === 'IMG') {
++      const img = target as HTMLImageElement;
++      if (state.tooltipImg !== img) {
++        hideImgTooltip();
++        state.tooltipImg = img;
++      }
++      if (state.imgTooltipTimer) clearTimeout(state.imgTooltipTimer);
++      const cx = e.clientX;
++      const cy = e.clientY;
++      state.imgTooltipTimer = setTimeout(() => showImgTooltip(img, cx, cy), 700);
++    } else {
++      if (state.tooltipImg) hideImgTooltip();
++    }
++  });
++
++  editor.addEventListener('mouseleave', () => {
++    hideImgTooltip();
++  });
++}
+diff --git a/src/webview/features/imageTransfer.ts b/src/webview/features/imageTransfer.ts
+new file mode 100644
+index 0000000..5cacb8d
+--- /dev/null
++++ b/src/webview/features/imageTransfer.ts
+@@ -0,0 +1,69 @@
++// Image paste + drag/drop handling. Reads images as base64 and delegates
++// file save to the extension host via `pasteImage` messages.
++
++import { postMessage } from '../vscodeApi';
++
++export function initImageTransfer(): void {
++  const editor = document.getElementById('editor')!;
++
++  editor.addEventListener('paste', (e: ClipboardEvent) => {
++    const items = e.clipboardData?.items;
++    if (!items) return;
++
++    for (let i = 0; i < items.length; i++) {
++      const item = items[i];
++      if (item.type.startsWith('image/')) {
++        e.preventDefault();
++        const blob = item.getAsFile();
++        if (!blob) continue;
++
++        const reader = new FileReader();
++        reader.onload = () => {
++          const result = reader.result as string;
++          const base64 = result.split(',')[1];
++          postMessage({
++            type: 'pasteImage',
++            data: base64,
++            mimeType: item.type,
++          });
++        };
++        reader.readAsDataURL(blob);
++        return;
++      }
++    }
++  });
++
++  editor.addEventListener('dragover', (e: DragEvent) => {
++    e.preventDefault();
++    editor.classList.add('drag-over');
++  });
++
++  editor.addEventListener('dragleave', () => {
++    editor.classList.remove('drag-over');
++  });
++
++  editor.addEventListener('drop', (e: DragEvent) => {
++    e.preventDefault();
++    editor.classList.remove('drag-over');
++
++    const files = e.dataTransfer?.files;
++    if (!files || files.length === 0) return;
++
++    for (let i = 0; i < files.length; i++) {
++      const file = files[i];
++      if (file.type.startsWith('image/')) {
++        const reader = new FileReader();
++        reader.onload = () => {
++          const result = reader.result as string;
++          const base64 = result.split(',')[1];
++          postMessage({
++            type: 'pasteImage',
++            data: base64,
++            mimeType: file.type,
++          });
++        };
++        reader.readAsDataURL(file);
++      }
++    }
++  });
++}
+diff --git a/src/webview/features/input.ts b/src/webview/features/input.ts
+new file mode 100644
+index 0000000..657d6fc
+--- /dev/null
++++ b/src/webview/features/input.ts
+@@ -0,0 +1,50 @@
++// Editor input + keyboard shortcut wiring.
++// - Mark document dirty + schedule sync + refresh outline on every input.
++// - Ctrl+K opens the link modal.
++// - Tab inside list items indents/outdents (instead of leaving the editor).
++
++import { state, editor } from '../state';
++import { scheduleSync, execCmd } from '../sync';
++import { scheduleNavRefresh } from './outline';
++import { requestSpellCheck } from '../spellcheck';
++
++export function initInput(): void {
++  // WYSIWYG input
++  editor.addEventListener('input', () => {
++    state.hasUserEdited = true;
++    scheduleSync();
++    scheduleNavRefresh();
++    requestSpellCheck();
++  });
++
++  // Keyboard shortcuts
++  editor.addEventListener('keydown', (e: KeyboardEvent) => {
++    if (e.ctrlKey || e.metaKey) {
++      switch (e.key.toLowerCase()) {
++        case 'k':
++          e.preventDefault();
++          document.getElementById('linkBtn')!.click();
++          break;
++        case 's':
++          // Let VS Code handle save
++          break;
++      }
++    }
++    // Tab in lists for indentation
++    if (e.key === 'Tab') {
++      const sel = window.getSelection();
++      if (sel && sel.anchorNode) {
++        const li = (sel.anchorNode as HTMLElement).closest?.('li') ||
++          (sel.anchorNode.parentElement as HTMLElement)?.closest?.('li');
++        if (li) {
++          e.preventDefault();
++          if (e.shiftKey) {
++            execCmd('outdent');
++          } else {
++            execCmd('indent');
++          }
++        }
++      }
++    }
++  });
++}
+diff --git a/src/webview/features/insert.ts b/src/webview/features/insert.ts
+new file mode 100644
+index 0000000..5bb1efc
+--- /dev/null
++++ b/src/webview/features/insert.ts
+@@ -0,0 +1,205 @@
++// "Insert" toolbar actions: task list, mark/highlight, link (modal), image
++// (delegated to extension), inline code, code block (modal), blockquote, hr,
++// table (modal).
++
++import { state, editor } from '../state';
++import { execCmd, scheduleSync } from '../sync';
++import { state as _unused } from '../state'; // ensure state import isn't elided if only types use it
++import { escapeHtml } from '../utils';
++import { postMessage } from '../vscodeApi';
++
++void _unused;
++
++export function initInsert(): void {
++  initTaskList();
++  initMark();
++  initLink();
++  initImage();
++  initInlineCode();
++  initCodeBlock();
++  initBlockquote();
++  initHr();
++  initTable();
++}
++
++function initTaskList(): void {
++  document.getElementById('taskListBtn')!.addEventListener('click', () => {
++    const html = `<ul class="task-list"><li class="task-list-item"><input type="checkbox" onclick="this.parentElement.classList.toggle('checked', this.checked); scheduleSync();"> Task item</li></ul>`;
++    execCmd('insertHTML', html);
++  });
++}
++
++function initMark(): void {
++  document.getElementById('markBtn')!.addEventListener('click', () => {
++    const sel = window.getSelection();
++    const content = sel && sel.toString() ? escapeHtml(sel.toString()) : 'highlighted text';
++    execCmd('insertHTML', `<mark>${content}</mark>`);
++  });
++}
++
++function initLink(): void {
++  document.getElementById('linkBtn')!.addEventListener('click', () => {
++    state.editingLinkElement = null;
++    const modal = document.getElementById('linkModal')!;
++    const sel = window.getSelection();
++    const selectedText = sel ? sel.toString() : '';
++    (document.getElementById('linkText') as HTMLInputElement).value = selectedText;
++    (document.getElementById('linkUrl') as HTMLInputElement).value = '';
++    (document.getElementById('linkTitle') as HTMLInputElement).value = '';
++    (document.getElementById('linkNewTab') as HTMLInputElement).checked = false;
++    modal.style.display = 'flex';
++    (document.getElementById('linkUrl') as HTMLInputElement).focus();
++  });
++
++  document.getElementById('linkInsertOk')!.addEventListener('click', () => {
++    const url = (document.getElementById('linkUrl') as HTMLInputElement).value;
++    const text = (document.getElementById('linkText') as HTMLInputElement).value || url;
++    const title = (document.getElementById('linkTitle') as HTMLInputElement).value;
++    const newTab = (document.getElementById('linkNewTab') as HTMLInputElement).checked;
++
++    if (url) {
++      if (state.editingLinkElement) {
++        state.editingLinkElement.href = url;
++        state.editingLinkElement.textContent = text;
++        state.editingLinkElement.title = title;
++        if (newTab) state.editingLinkElement.setAttribute('target', '_blank');
++        else state.editingLinkElement.removeAttribute('target');
++        state.editingLinkElement = null;
++        state.hasUserEdited = true;
++        scheduleSync();
++      } else {
++        let html = `<a href="${escapeHtml(url)}"`;
++        if (title) html += ` title="${escapeHtml(title)}"`;
++        if (newTab) html += ` target="_blank"`;
++        html += `>${escapeHtml(text)}</a>`;
++        execCmd('insertHTML', html);
++      }
++    }
++    document.getElementById('linkModal')!.style.display = 'none';
++  });
++
++  document.getElementById('linkInsertCancel')!.addEventListener('click', () => {
++    document.getElementById('linkModal')!.style.display = 'none';
++  });
++}
++
++function initImage(): void {
++  document.getElementById('imageBtn')!.addEventListener('click', () => {
++    postMessage({ type: 'insertImage' });
++  });
++}
++
++function initInlineCode(): void {
++  document.getElementById('inlineCodeBtn')!.addEventListener('click', () => {
++    const sel = window.getSelection();
++    if (sel && sel.toString()) {
++      execCmd('insertHTML', `<code>${escapeHtml(sel.toString())}</code>`);
++    } else {
++      execCmd('insertHTML', '<code>code</code>');
++    }
++  });
++}
++
++function initCodeBlock(): void {
++  document.getElementById('codeBlockBtn')!.addEventListener('click', () => {
++    const sel = window.getSelection();
++    if (sel && sel.rangeCount > 0) state.savedCodeRange = sel.getRangeAt(0).cloneRange();
++    (document.getElementById('codeLanguageSelect') as HTMLSelectElement).value = '';
++    document.getElementById('codeBlockModal')!.style.display = 'flex';
++  });
++
++  document.getElementById('codeBlockInsertOk')!.addEventListener('click', () => {
++    const lang = (document.getElementById('codeLanguageSelect') as HTMLSelectElement).value;
++    const langAttr = lang ? ` class="language-${lang}"` : '';
++    document.getElementById('codeBlockModal')!.style.display = 'none';
++    editor.focus();
++    if (state.savedCodeRange) {
++      const s = window.getSelection();
++      if (s) { s.removeAllRanges(); s.addRange(state.savedCodeRange); }
++      state.savedCodeRange = null;
++    }
++    const selectedText = window.getSelection()?.toString() || 'code here';
++    document.execCommand('insertHTML', false, `<pre><code${langAttr}>${escapeHtml(selectedText)}</code></pre><p><br></p>`);
++    state.hasUserEdited = true;
++    scheduleSync();
++  });
++
++  document.getElementById('codeBlockInsertCancel')!.addEventListener('click', () => {
++    document.getElementById('codeBlockModal')!.style.display = 'none';
++    state.savedCodeRange = null;
++  });
++}
++
++function initBlockquote(): void {
++  document.getElementById('blockquoteBtn')!.addEventListener('click', () => {
++    execCmd('formatBlock', '<blockquote>');
++  });
++}
++
++function initHr(): void {
++  document.getElementById('hrBtn')!.addEventListener('click', () => {
++    execCmd('insertHTML', '<hr><p><br></p>');
++  });
++}
++
++function initTable(): void {
++  document.getElementById('tableBtn')!.addEventListener('click', () => {
++    // Save current selection/cursor position before modal steals focus
++    const sel = window.getSelection();
++    if (sel && sel.rangeCount > 0) {
++      state.savedTableRange = sel.getRangeAt(0).cloneRange();
++    }
++    // Reset inputs to defaults
++    (document.getElementById('tableRows') as HTMLInputElement).value = '3';
++    (document.getElementById('tableCols') as HTMLInputElement).value = '3';
++    document.getElementById('tableModal')!.style.display = 'flex';
++    (document.getElementById('tableRows') as HTMLInputElement).focus();
++  });
++
++  document.getElementById('tableInsertOk')!.addEventListener('click', () => {
++    const rows = parseInt((document.getElementById('tableRows') as HTMLInputElement).value) || 3;
++    const cols = parseInt((document.getElementById('tableCols') as HTMLInputElement).value) || 3;
++    const hasHeader = (document.getElementById('tableHeader') as HTMLInputElement).checked;
++
++    let html = '<table>';
++    if (hasHeader) {
++      html += '<thead><tr>';
++      for (let c = 0; c < cols; c++) {
++        html += `<th>Header ${c + 1}</th>`;
++      }
++      html += '</tr></thead>';
++    }
++    html += '<tbody>';
++    const startRow = hasHeader ? 1 : 0;
++    for (let r = startRow; r < rows; r++) {
++      html += '<tr>';
++      for (let c = 0; c < cols; c++) {
++        html += '<td>&nbsp;</td>';
++      }
++      html += '</tr>';
++    }
++    html += '</tbody></table><p><br></p>';
++
++    document.getElementById('tableModal')!.style.display = 'none';
++
++    // Restore focus and selection in the editor before inserting
++    editor.focus();
++    if (state.savedTableRange) {
++      const sel = window.getSelection();
++      if (sel) {
++        sel.removeAllRanges();
++        sel.addRange(state.savedTableRange);
++      }
++      state.savedTableRange = null;
++    }
++
++    document.execCommand('insertHTML', false, html);
++    state.hasUserEdited = true;
++    scheduleSync();
++  });
++
++  document.getElementById('tableInsertCancel')!.addEventListener('click', () => {
++    document.getElementById('tableModal')!.style.display = 'none';
++    state.savedTableRange = null;
++  });
++}
+diff --git a/src/webview/features/messages.ts b/src/webview/features/messages.ts
+new file mode 100644
+index 0000000..4e0aafb
+--- /dev/null
++++ b/src/webview/features/messages.ts
+@@ -0,0 +1,56 @@
++// Inbound message handler from the extension host.
++//   - 'update'           : document content changed externally; refresh editor.
++//   - 'loadCustomWords'  : add user-persisted words to the dictionary.
++//   - 'imageInserted'    : image was saved to .attachments/; insert at cursor.
++
++import { state, editor } from '../state';
++import { markdownToHtml } from '../markdown';
++import { updateWordCount } from '../sync';
++import { scheduleNavRefresh } from './outline';
++import { requestSpellCheck, loadCustomWords } from '../spellcheck';
++import { execCmd } from '../sync';
++import { escapeHtml } from '../utils';
++
++interface InboundMessage {
++  type: 'update' | 'loadCustomWords' | 'imageInserted';
++  content?: string;
++  words?: string[];
++  src?: string;
++  alt?: string;
++  markdownPath?: string;
++}
++
++export function initMessages(): void {
++  window.addEventListener('message', (event: MessageEvent) => {
++    const message = event.data as InboundMessage;
++    switch (message.type) {
++      case 'update': {
++        state.isUpdatingFromExtension = true;
++        const html = markdownToHtml(message.content || '');
++        // Preserve scroll position
++        const scrollTop = editor.scrollTop;
++        editor.innerHTML = html;
++        editor.scrollTop = scrollTop;
++        updateWordCount(message.content || '');
++        // Keep flag true briefly to catch async input events from innerHTML
++        setTimeout(() => {
++          state.isUpdatingFromExtension = false;
++        }, 100);
++        scheduleNavRefresh();
++        requestSpellCheck();
++        break;
++      }
++
++      case 'loadCustomWords': {
++        loadCustomWords(message.words || []);
++        break;
++      }
++
++      case 'imageInserted': {
++        const imgHtml = `<img src="${escapeHtml(message.src || '')}" alt="${escapeHtml(message.alt || '')}" style="max-width: 100%;">`;
++        execCmd('insertHTML', imgHtml + '<p><br></p>');
++        break;
++      }
++    }
++  });
++}
+diff --git a/src/webview/features/modals.ts b/src/webview/features/modals.ts
+new file mode 100644
+index 0000000..63a6eb1
+--- /dev/null
++++ b/src/webview/features/modals.ts
+@@ -0,0 +1,21 @@
++// Generic modal handlers: close on backdrop click, close on Escape.
++
++export function initModals(): void {
++  // Close modals on backdrop click
++  document.querySelectorAll('.modal').forEach((modal) => {
++    modal.addEventListener('click', (e) => {
++      if (e.target === modal) {
++        (modal as HTMLElement).style.display = 'none';
++      }
++    });
++  });
++
++  // Close modals on Escape
++  document.addEventListener('keydown', (e) => {
++    if (e.key === 'Escape') {
++      document.querySelectorAll('.modal').forEach((modal) => {
++        (modal as HTMLElement).style.display = 'none';
++      });
++    }
++  });
++}
+diff --git a/src/webview/features/outline.ts b/src/webview/features/outline.ts
+new file mode 100644
+index 0000000..514e0ce
+--- /dev/null
++++ b/src/webview/features/outline.ts
+@@ -0,0 +1,75 @@
++// Outline / navigation pane: lists all headings, click-to-scroll,
++// scroll-spy highlights the active heading.
++
++import { state, editor, editorContainer, navPane, navList } from '../state';
++
++let navUpdateTimer: ReturnType<typeof setTimeout> | null = null;
++
++function toggleNav(show?: boolean): void {
++  state.isNavVisible = show !== undefined ? show : !state.isNavVisible;
++  navPane.style.display = state.isNavVisible ? 'flex' : 'none';
++  const btn = document.getElementById('toggleNavBtn');
++  if (btn) btn.classList.toggle('active', state.isNavVisible);
++  if (state.isNavVisible) refreshNav();
++}
++
++function refreshNav(): void {
++  if (!state.isNavVisible) return;
++  const headings = editor.querySelectorAll('h1, h2, h3, h4, h5, h6');
++  navList.innerHTML = '';
++
++  headings.forEach((heading) => {
++    const text = heading.textContent?.trim();
++    if (!text) return; // Skip empty headings
++    const level = parseInt(heading.tagName[1]);
++    const btn = document.createElement('button');
++    btn.className = 'nav-item';
++    btn.setAttribute('data-level', String(level));
++    btn.textContent = text;
++    btn.title = text;
++    btn.addEventListener('click', () => {
++      heading.scrollIntoView({ behavior: 'smooth', block: 'start' });
++      // Highlight briefly
++      navList.querySelectorAll('.nav-item').forEach((el) => el.classList.remove('active'));
++      btn.classList.add('active');
++    });
++    navList.appendChild(btn);
++  });
++
++  if (headings.length === 0) {
++    const empty = document.createElement('div');
++    empty.style.padding = '12px';
++    empty.style.fontSize = '12px';
++    empty.style.opacity = '0.5';
++    empty.textContent = 'No headings found';
++    navList.appendChild(empty);
++  }
++}
++
++export function scheduleNavRefresh(): void {
++  if (navUpdateTimer) clearTimeout(navUpdateTimer);
++  navUpdateTimer = setTimeout(refreshNav, 600);
++}
++
++export function initOutline(): void {
++  document.getElementById('toggleNavBtn')!.addEventListener('click', () => toggleNav());
++  document.getElementById('navCloseBtn')!.addEventListener('click', () => toggleNav(false));
++
++  // Scroll-spy: highlight active heading in nav
++  editorContainer.addEventListener('scroll', () => {
++    if (!state.isNavVisible) return;
++    const headings = editor.querySelectorAll('h1, h2, h3, h4, h5, h6');
++    const containerRect = editorContainer.getBoundingClientRect();
++    let activeIndex = -1;
++    headings.forEach((h, i) => {
++      const rect = h.getBoundingClientRect();
++      if (rect.top <= containerRect.top + 60) {
++        activeIndex = i;
++      }
++    });
++    const navItems = navList.querySelectorAll('.nav-item');
++    navItems.forEach((item, i) => {
++      item.classList.toggle('active', i === activeIndex);
++    });
++  });
++}
+diff --git a/src/webview/features/textEditorToggle.ts b/src/webview/features/textEditorToggle.ts
+new file mode 100644
+index 0000000..c42575f
+--- /dev/null
++++ b/src/webview/features/textEditorToggle.ts
+@@ -0,0 +1,17 @@
++// "Text Editor" status-bar button: posts a message to the extension host to
++// toggle the current document to VS Code's built-in Text Editor (and back).
++//
++// This is the in-webview counterpart of the `visualMarkdownEditor.toggleTextEditor`
++// command. It exists so the user has a visible button to click (not just a
++// keyboard shortcut), and because the webview can't invoke VS Code commands
++// directly — it has to ask the extension host to do it.
++
++import { postMessage } from '../vscodeApi';
++
++export function initTextEditorToggle(): void {
++  const btn = document.getElementById('toggleTextEditorBtn');
++  if (!btn) return;
++  btn.addEventListener('click', () => {
++    postMessage({ type: 'toggleTextEditor' });
++  });
++}
+diff --git a/src/webview/features/toolbar.ts b/src/webview/features/toolbar.ts
+new file mode 100644
+index 0000000..d2090bc
+--- /dev/null
++++ b/src/webview/features/toolbar.ts
+@@ -0,0 +1,64 @@
++// Toolbar wiring: standard execCommand buttons, heading select, font-size
++// select, plus active-state tracking on selection changes.
++
++import { state, editor, headingSelect, fontSizeSelect } from '../state';
++import { execCmd } from '../sync';
++
++export function initToolbar(): void {
++  // Standard toolbar buttons
++  document.querySelectorAll('.toolbar-btn[data-command]').forEach((btn) => {
++    btn.addEventListener('click', () => {
++      const command = (btn as HTMLElement).dataset.command!;
++      execCmd(command);
++    });
++  });
++
++  // Heading select
++  headingSelect.addEventListener('change', () => {
++    const value = headingSelect.value;
++    if (value === 'p') {
++      execCmd('formatBlock', '<p>');
++    } else {
++      execCmd('formatBlock', `<${value}>`);
++    }
++    headingSelect.value = value;
++  });
++
++  // Font size select
++  fontSizeSelect.addEventListener('change', () => {
++    const value = fontSizeSelect.value;
++    if (value) {
++      execCmd('fontSize', value);
++    }
++    fontSizeSelect.value = '';
++  });
++
++  // Active-state tracking
++  editor.addEventListener('keyup', updateToolbarState);
++  editor.addEventListener('mouseup', updateToolbarState);
++}
++
++function updateToolbarState(): void {
++  // Update heading select
++  const block = document.queryCommandValue('formatBlock');
++  const headingMap: Record<string, string> = {
++    h1: 'h1', h2: 'h2', h3: 'h3', h4: 'h4', h5: 'h5', h6: 'h6',
++    p: 'p', div: 'p',
++  };
++  headingSelect.value = headingMap[block.toLowerCase()] || 'p';
++
++  // Highlight active formatting buttons
++  const commands = ['bold', 'italic', 'underline', 'strikeThrough', 'superscript', 'subscript'];
++  commands.forEach((cmd) => {
++    const btn = document.querySelector(`.toolbar-btn[data-command="${cmd}"]`);
++    if (btn) {
++      btn.classList.toggle('active', document.queryCommandState(cmd));
++    }
++  });
++}
++
++// Re-exported so consumers can mark the document dirty without going through
++// the deprecated execCommand path (e.g. for inline link edits).
++export function markEdited(): void {
++  state.hasUserEdited = true;
++}
+diff --git a/src/webview/features/zoom.ts b/src/webview/features/zoom.ts
+new file mode 100644
+index 0000000..cc35386
+--- /dev/null
++++ b/src/webview/features/zoom.ts
+@@ -0,0 +1,33 @@
++// Zoom + page-mode controls. Zoom is exposed via the status-bar slider and
++// Ctrl+wheel. Page mode wraps the editor in a centered "page" layout and
++// resets zoom to 100%.
++
++import { state, editor, editorContainer, zoomSlider, zoomValue, pageModeBtn } from '../state';
++
++function setZoom(level: number): void {
++  state.currentZoom = Math.max(50, Math.min(200, level));
++  (editor.style as any).zoom = `${state.currentZoom}%`;
++  zoomSlider.value = String(state.currentZoom);
++  zoomValue.textContent = `${state.currentZoom}%`;
++}
++
++export function initZoom(): void {
++  zoomSlider.addEventListener('input', () => {
++    setZoom(parseInt(zoomSlider.value, 10));
++  });
++
++  editorContainer.addEventListener('wheel', (e: WheelEvent) => {
++    if (e.ctrlKey) {
++      e.preventDefault();
++      const delta = e.deltaY > 0 ? -10 : 10;
++      setZoom(state.currentZoom + delta);
++    }
++  }, { passive: false });
++
++  pageModeBtn.addEventListener('click', () => {
++    state.isPageMode = !state.isPageMode;
++    editorContainer.classList.toggle('page-mode', state.isPageMode);
++    pageModeBtn.classList.toggle('active', state.isPageMode);
++    if (state.isPageMode) setZoom(100);
++  });
++}
+diff --git a/src/webview/markdown.ts b/src/webview/markdown.ts
+new file mode 100644
+index 0000000..9a532a0
+--- /dev/null
++++ b/src/webview/markdown.ts
+@@ -0,0 +1,196 @@
++// Markdown <-> HTML conversion.
++// Configures `marked` (MD -> HTML) and `turndown` (HTML -> MD) with the same
++// rules as the original monolithic webview so output is byte-for-byte identical.
++//
++// Image paths are resolved against window.__baseUri (document dir) or
++// window.__attachmentsBaseUri (parent dir, used for /.attachments/ paths).
++
++import { marked } from 'marked';
++import TurndownService from 'turndown';
++import { gfm } from 'turndown-plugin-gfm';
++
++marked.setOptions({
++  gfm: true,
++  breaks: true,
++});
++
++const turndownService = new TurndownService({
++  headingStyle: 'atx',
++  hr: '---',
++  bulletListMarker: '-',
++  codeBlockStyle: 'fenced',
++  fence: '```',
++  emDelimiter: '*',
++  strongDelimiter: '**',
++  linkStyle: 'inlined',
++});
++turndownService.use(gfm);
++
++// Keep style spans (colors, font-size, etc.)
++turndownService.addRule('styledSpan', {
++  filter: (node) => {
++    return node.nodeName === 'SPAN' && !!(node as HTMLElement).getAttribute('style');
++  },
++  replacement: (content, node) => {
++    const el = node as HTMLElement;
++    const style = el.getAttribute('style') || '';
++    if (!content.trim()) return '';
++    return `<span style="${style}">${content}</span>`;
++  },
++});
++
++// Keep underline
++turndownService.addRule('underline', {
++  filter: ['u'],
++  replacement: (content) => {
++    if (!content.trim()) return '';
++    return `<u>${content}</u>`;
++  },
++});
++
++// Keep superscript/subscript
++turndownService.addRule('superscript', {
++  filter: ['sup'],
++  replacement: (content) => `<sup>${content}</sup>`,
++});
++turndownService.addRule('subscript', {
++  filter: ['sub'],
++  replacement: (content) => `<sub>${content}</sub>`,
++});
++
++// Keep alignment divs
++turndownService.addRule('alignedDiv', {
++  filter: (node) => {
++    if (node.nodeName !== 'DIV') return false;
++    const style = (node as HTMLElement).getAttribute('style') || '';
++    return /text-align/.test(style);
++  },
++  replacement: (content, node) => {
++    const el = node as HTMLElement;
++    const style = el.getAttribute('style') || '';
++    return `<div style="${style}">\n\n${content}\n\n</div>\n\n`;
++  },
++});
++
++// Keep font tags (from execCommand fontSize)
++turndownService.addRule('fontTag', {
++  filter: ['font'],
++  replacement: (content, node) => {
++    const el = node as HTMLElement;
++    const color = el.getAttribute('color');
++    const size = el.getAttribute('size');
++    const face = el.getAttribute('face');
++    const styles: string[] = [];
++    if (color) styles.push(`color: ${color}`);
++    if (size) {
++      const sizeMap: Record<string, string> = {
++        '1': '8pt', '2': '10pt', '3': '12pt', '4': '14pt',
++        '5': '18pt', '6': '24pt', '7': '36pt',
++      };
++      styles.push(`font-size: ${sizeMap[size] || size}`);
++    }
++    if (face) styles.push(`font-family: ${face}`);
++    if (styles.length === 0) return content;
++    return `<span style="${styles.join('; ')}">${content}</span>`;
++  },
++});
++
++// Task list support
++turndownService.addRule('taskListItem', {
++  filter: (node) => {
++    return (
++      node.nodeName === 'LI' &&
++      (node as HTMLElement).querySelector('input[type="checkbox"]') !== null
++    );
++  },
++  replacement: (content, node) => {
++    const el = node as HTMLElement;
++    const checkbox = el.querySelector('input[type="checkbox"]') as HTMLInputElement;
++    const checked = checkbox?.checked ? 'x' : ' ';
++    const text = content.replace(/^\s*\[.\]\s*/, '').trim();
++    return `- [${checked}] ${text}\n`;
++  },
++});
++
++// Keep mark/highlight
++turndownService.addRule('mark', {
++  filter: ['mark'],
++  replacement: (content) => `<mark>${content}</mark>`,
++});
++
++interface WebviewWindow extends Window {
++  __baseUri?: string;
++  __attachmentsBaseUri?: string;
++}
++
++function getWebviewWindow(): WebviewWindow {
++  return window as unknown as WebviewWindow;
++}
++
++export function markdownToHtml(md: string): string {
++  let html = marked.parse(md) as string;
++  // Convert task list items
++  html = html.replace(
++    /<li>\s*\[([ xX])\]\s*/g,
++    (_, checked) => {
++      const isChecked = checked.toLowerCase() === 'x';
++      return `<li class="task-list-item"><input type="checkbox" ${isChecked ? 'checked' : ''} onclick="this.parentElement.classList.toggle('checked', this.checked); scheduleSync();"> `;
++    }
++  );
++  // Resolve relative image paths to webview URIs so images display
++  const w = getWebviewWindow();
++  const baseUri = w.__baseUri;
++  const attachmentsBaseUri = w.__attachmentsBaseUri;
++  if (baseUri) {
++    html = html.replace(
++      /<img\s+([^>]*?)src="(?!https?:\/\/|data:|blob:|vscode-)([^"]+)"([^>]*?)>/gi,
++      (match, before, src, after) => {
++        let actualSrc = src;
++        let slashPrefix = false;
++        // Leading slash (e.g. /.attachments/img.png) means one directory up
++        if (src.startsWith('/.attachments/') || src.startsWith('/.attachments\\')) {
++          actualSrc = src.slice(1); // Remove leading /
++          slashPrefix = true;
++        }
++        let base: string;
++        if (slashPrefix) {
++          // /.attachments/ -> resolve from parent (attachmentsBaseUri)
++          base = attachmentsBaseUri || baseUri;
++        } else {
++          // .attachments/ or other relative -> resolve from document directory
++          base = baseUri;
++        }
++        const resolved = `${base}/${actualSrc}`;
++        const dataAttr = slashPrefix ? ' data-slash-prefix="true"' : '';
++        return `<img ${before}src="${resolved}"${dataAttr}${after}>`;
++      }
++    );
++  }
++  return html;
++}
++
++export function htmlToMarkdown(html: string): string {
++  // Strip webview base URI from image src before conversion so markdown gets relative paths
++  // IMPORTANT: strip baseUri (more specific/longer) BEFORE attachmentsBaseUri (parent)
++  // to avoid partial matches leaving folder names like "markdown/" behind
++  const w = getWebviewWindow();
++  const baseUri = w.__baseUri;
++  const attachmentsBaseUri = w.__attachmentsBaseUri;
++  if (baseUri) {
++    const escaped = baseUri.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++    html = html.replace(new RegExp(escaped + '/', 'g'), '');
++  }
++  if (attachmentsBaseUri && attachmentsBaseUri !== baseUri) {
++    const escaped = attachmentsBaseUri.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++    html = html.replace(new RegExp(escaped + '/', 'g'), '');
++  }
++  // Restore leading slash for /.attachments/ paths that had it originally
++  html = html.replace(
++    /<img([^>]*?)data-slash-prefix="true"([^>]*?)>/gi,
++    (match) => match.replace(/src="(\.attachments\/)/i, 'src="/.attachments/')
++  );
++  let md = turndownService.turndown(html);
++  // Clean up extra blank lines
++  md = md.replace(/\n{3,}/g, '\n\n');
++  return md;
++}
+diff --git a/src/webview/spellcheck.ts b/src/webview/spellcheck.ts
+new file mode 100644
+index 0000000..0797903
+--- /dev/null
++++ b/src/webview/spellcheck.ts
+@@ -0,0 +1,144 @@
++// Client-side spell check.
++// - `dictionary` is a Set seeded from `an-array-of-english-words` plus a few
++//   short technical words.
++// - `checkWord()` / `getSuggestions()` power the context-menu suggestions.
++// - `requestSpellCheck()` debounces a re-scan of the editor text and updates
++//   the CSS Custom Highlight API ranges for squiggly underlines.
++
++import words from 'an-array-of-english-words';
++import { state, editor } from './state';
++import { postMessage } from './vscodeApi';
++
++const dictionary = new Set(words);
++['i', 'a', 'vs', 'ok', 'eg', 'ie', 'etc', 'url', 'html', 'css', 'js', 'ts',
++ 'api', 'ui', 'id', 'pdf', 'http', 'https', 'www', 'dev', 'src', 'img'].forEach(w => dictionary.add(w));
++
++export function checkWord(word: string): boolean {
++  if (word.length < 2) return true;
++  const lower = word.toLowerCase();
++  return dictionary.has(lower) || dictionary.has(word);
++}
++
++export function edits1(word: string): string[] {
++  const results: string[] = [];
++  const letters = 'abcdefghijklmnopqrstuvwxyz';
++  for (let i = 0; i <= word.length; i++) {
++    if (i < word.length) results.push(word.slice(0, i) + word.slice(i + 1));
++    for (const c of letters) results.push(word.slice(0, i) + c + word.slice(i));
++    if (i < word.length) {
++      for (const c of letters) results.push(word.slice(0, i) + c + word.slice(i + 1));
++    }
++    if (i < word.length - 1) results.push(word.slice(0, i) + word[i + 1] + word[i] + word.slice(i + 2));
++  }
++  return results;
++}
++
++export function getSuggestions(word: string, max: number = 6): string[] {
++  const lower = word.toLowerCase();
++  const suggestions: string[] = [];
++  const seen = new Set<string>();
++
++  for (const candidate of edits1(lower)) {
++    if (dictionary.has(candidate) && !seen.has(candidate)) {
++      seen.add(candidate);
++      suggestions.push(candidate);
++      if (suggestions.length >= max) return suggestions;
++    }
++  }
++
++  // Limited edit distance 2
++  if (suggestions.length < max) {
++    const e1 = edits1(lower);
++    const limit = Math.min(e1.length, 50);
++    for (let i = 0; i < limit && suggestions.length < max; i++) {
++      for (const candidate of edits1(e1[i])) {
++        if (dictionary.has(candidate) && !seen.has(candidate) && candidate !== lower) {
++          seen.add(candidate);
++          suggestions.push(candidate);
++          if (suggestions.length >= max) return suggestions;
++        }
++      }
++    }
++  }
++  return suggestions;
++}
++
++let spellCheckTimer: ReturnType<typeof setTimeout> | null = null;
++
++export function requestSpellCheck(): void {
++  if (spellCheckTimer) clearTimeout(spellCheckTimer);
++  spellCheckTimer = setTimeout(runSpellCheck, 300);
++}
++
++function runSpellCheck(): void {
++  const text = editor.innerText || '';
++  const wordRegex = /[a-zA-Z'\u2019]+/g;
++  const misspelled = new Set<string>();
++  let match;
++  while ((match = wordRegex.exec(text)) !== null) {
++    const word = match[0].replace(/^['']+|['']+$/g, '');
++    if (!checkWord(word)) {
++      misspelled.add(word.toLowerCase());
++    }
++  }
++  state.currentMisspelled = misspelled;
++  applySpellHighlights();
++}
++
++function applySpellHighlights(): void {
++  // Use CSS Custom Highlight API if available
++  if (!(CSS as any).highlights) return;
++  const ranges: Range[] = [];
++  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
++  const wordRegex = /[a-zA-Z'\u2019]+/g;
++
++  let node: Text | null;
++  while ((node = walker.nextNode() as Text | null)) {
++    const text = node.textContent || '';
++    let match;
++    wordRegex.lastIndex = 0;
++    while ((match = wordRegex.exec(text)) !== null) {
++      const word = match[0].replace(/^['']+|['']+$/g, '');
++      if (word.length < 2) continue;
++      if (state.currentMisspelled.has(word.toLowerCase())) {
++        const range = document.createRange();
++        range.setStart(node, match.index);
++        range.setEnd(node, match.index + match[0].length);
++        ranges.push(range);
++      }
++    }
++  }
++
++  const highlight = new (window as any).Highlight(...ranges);
++  (CSS as any).highlights.set('spelling-error', highlight);
++}
++
++/** Add a custom word (from context menu) to the in-memory dictionary and notify the host. */
++export function addCustomWord(word: string): void {
++  const lower = word.toLowerCase();
++  state.currentMisspelled.delete(lower);
++  dictionary.add(lower);
++  postMessage({ type: 'addCustomWord', word: lower });
++  applySpellHighlights();
++}
++
++/** Bulk-load persisted custom words from the extension host. */
++export function loadCustomWords(words: string[]): void {
++  words.forEach((w) => dictionary.add(w));
++  requestSpellCheck();
++}
++
++/** Replace a misspelled word at a saved (Text node, start, end) target. */
++export function replaceWordAt(replacement: string): void {
++  if (!state.contextMenuTarget) return;
++  const { node, start, end } = state.contextMenuTarget;
++  const text = node.textContent || '';
++  node.textContent = text.slice(0, start) + replacement + text.slice(end);
++  state.contextMenuTarget = null;
++  // Schedule sync + re-spellcheck via dynamic import to avoid circular dep
++  // with sync.ts (which imports state, not spellcheck).
++  import('./sync').then(({ scheduleSync }) => {
++    scheduleSync();
++    requestSpellCheck();
++  });
++}
+diff --git a/src/webview/state.ts b/src/webview/state.ts
+new file mode 100644
+index 0000000..5e70e3a
+--- /dev/null
++++ b/src/webview/state.ts
+@@ -0,0 +1,53 @@
++// Shared state and DOM references for the webview.
++// All mutable flags live on the `state` object so mutations are visible to
++// every module that imports it (live binding). DOM elements are queried once
++// at module load and exported as `const`.
++
++export const editor = document.getElementById('editor') as HTMLElement;
++export const editorContainer = document.getElementById('editorContainer') as HTMLElement;
++export const wordCountEl = document.getElementById('wordCount') as HTMLElement;
++export const charCountEl = document.getElementById('charCount') as HTMLElement;
++export const navPane = document.getElementById('navPane') as HTMLElement;
++export const navList = document.getElementById('navList') as HTMLElement;
++export const headingSelect = document.getElementById('headingSelect') as HTMLSelectElement;
++export const fontSizeSelect = document.getElementById('fontSizeSelect') as HTMLSelectElement;
++export const zoomSlider = document.getElementById('zoomSlider') as HTMLInputElement;
++export const zoomValue = document.getElementById('zoomValue') as HTMLElement;
++export const pageModeBtn = document.getElementById('togglePageModeBtn') as HTMLElement;
++
++export interface ContextMenuTarget {
++  node: Text;
++  start: number;
++  end: number;
++  word: string;
++}
++
++export const state = {
++  // View mode flags
++  isUpdatingFromExtension: false,
++  isNavVisible: false,
++  hasUserEdited: false,
++  isPageMode: false,
++
++  // Zoom
++  currentZoom: 100,
++
++  // Spell-check
++  currentMisspelled: new Set<string>(),
++
++  // Color palette
++  recentColors: JSON.parse(localStorage.getItem('recentColors') || '[]') as string[],
++
++  // Transient edit state
++  editingLinkElement: null as HTMLAnchorElement | null,
++  savedCodeRange: null as Range | null,
++  savedTableRange: null as Range | null,
++
++  // Context menu state
++  contextMenuTarget: null as ContextMenuTarget | null,
++  pendingContextMenuPos: { x: 0, y: 0 } as { x: number; y: number },
++
++  // Image tooltip
++  tooltipImg: null as HTMLImageElement | null,
++  imgTooltipTimer: null as ReturnType<typeof setTimeout> | null,
++};
+diff --git a/src/webview/sync.ts b/src/webview/sync.ts
+new file mode 100644
+index 0000000..9acf8f8
+--- /dev/null
++++ b/src/webview/sync.ts
+@@ -0,0 +1,36 @@
++// Two-way sync glue between the webview DOM and the extension host.
++// - `scheduleSync()` debounces a HTML -> MD -> postMessage('edit') round-trip.
++// - `execCmd()` is the standard wrapper around document.execCommand that also
++//   marks the document as dirty and triggers a sync.
++// - `updateWordCount()` refreshes the status-bar counters.
++
++import { state, editor, wordCountEl, charCountEl } from './state';
++import { htmlToMarkdown } from './markdown';
++import { postMessage } from './vscodeApi';
++
++let debounceTimer: ReturnType<typeof setTimeout> | null = null;
++
++export function scheduleSync(): void {
++  if (state.isUpdatingFromExtension) return;
++  if (!state.hasUserEdited) return;
++  if (debounceTimer) clearTimeout(debounceTimer);
++  debounceTimer = setTimeout(() => {
++    const md = htmlToMarkdown(editor.innerHTML);
++    postMessage({ type: 'edit', content: md });
++    updateWordCount(md);
++  }, 500);
++}
++
++export function updateWordCount(text: string): void {
++  const words = text.trim().split(/\s+/).filter((w) => w.length > 0).length;
++  const chars = text.length;
++  wordCountEl.textContent = `Words: ${words}`;
++  charCountEl.textContent = `Characters: ${chars}`;
++}
++
++export function execCmd(command: string, value?: string): void {
++  document.execCommand(command, false, value);
++  editor.focus();
++  state.hasUserEdited = true;
++  scheduleSync();
++}
+diff --git a/src/webview/utils.ts b/src/webview/utils.ts
+new file mode 100644
+index 0000000..ea647de
+--- /dev/null
++++ b/src/webview/utils.ts
+@@ -0,0 +1,21 @@
++// Small DOM utilities shared across feature modules.
++
++export function escapeHtml(text: string): string {
++  const div = document.createElement('div');
++  div.appendChild(document.createTextNode(text));
++  return div.innerHTML;
++}
++
++/**
++ * Position a context-menu element so it stays inside the viewport.
++ * Mutates `menu.style.left` / `menu.style.top` in place.
++ */
++export function clampToViewport(menu: HTMLElement): void {
++  const rect = menu.getBoundingClientRect();
++  if (rect.right > window.innerWidth) {
++    menu.style.left = `${window.innerWidth - rect.width - 5}px`;
++  }
++  if (rect.bottom > window.innerHeight) {
++    menu.style.top = `${window.innerHeight - rect.height - 5}px`;
++  }
++}
+diff --git a/src/webview/vscodeApi.ts b/src/webview/vscodeApi.ts
+new file mode 100644
+index 0000000..90019c5
+--- /dev/null
++++ b/src/webview/vscodeApi.ts
+@@ -0,0 +1,24 @@
++// Thin wrapper around the VS Code webview API so other modules don't have to
++// redeclare the global `acquireVsCodeApi` shim.
++
++declare function acquireVsCodeApi(): {
++  postMessage(message: unknown): void;
++  getState(): unknown;
++  setState(state: unknown): void;
++};
++
++export const vscode = acquireVsCodeApi();
++
++export type VsCodeMessage =
++  | { type: 'ready' }
++  | { type: 'edit'; content: string }
++  | { type: 'insertImage' }
++  | { type: 'pasteImage'; data: string; mimeType: string }
++  | { type: 'deleteImage'; relativePath: string }
++  | { type: 'addCustomWord'; word: string }
++  | { type: 'showInfo'; text: string }
++  | { type: 'toggleTextEditor' };
++
++export function postMessage(message: VsCodeMessage): void {
++  vscode.postMessage(message);
++}
