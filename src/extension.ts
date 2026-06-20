@@ -55,6 +55,55 @@ export function activate(context: vscode.ExtensionContext) {
       await vscode.commands.executeCommand('vscode.openWith', uri, 'visualMarkdownEditor.editor');
     })
   );
+
+  /**
+   * Toggle the active Markdown file between the Visual Markdown Editor (custom
+   * webview editor) and VS Code's built-in Text Editor.
+   *
+   * Why this exists: the visual editor is a webview, so Copilot Chat / inline
+   * completions / `#selection` can't see what the user has selected inside it.
+   * Swapping to a real Text Editor — in the same tab, no split — restores all
+   * of those features. Press Ctrl+Alt+V (or click "Text Editor" in the status
+   * bar) to flip; press it again to flip back.
+   */
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'visualMarkdownEditor.toggleTextEditor',
+      async (uri?: vscode.Uri) => {
+        const activeTextEditor = vscode.window.activeTextEditor;
+
+        // 1. Caller passed a URI (e.g. the webview's status-bar button) — use it.
+        // 2. User is currently in a Text Editor — use that document's URI.
+        // 3. User is in the visual editor (webview focused) — fall back to the
+        //    most recently active custom editor URI tracked by the provider.
+        if (!uri) {
+          if (activeTextEditor) {
+            uri = activeTextEditor.document.uri;
+          } else {
+            uri = MarkdownEditorProvider.getActiveUri();
+          }
+        }
+
+        if (!uri) {
+          vscode.window.showWarningMessage(
+            'Toggle Text Editor: open a Markdown file first.'
+          );
+          return;
+        }
+
+        // If a Text Editor is currently active for this URI, switch to the
+        // visual editor. Otherwise switch to the default Text Editor.
+        const inTextEditor = !!activeTextEditor
+          && activeTextEditor.document.uri.toString() === uri.toString();
+
+        const targetEditor = inTextEditor
+          ? 'visualMarkdownEditor.editor'
+          : 'default';
+
+        await vscode.commands.executeCommand('vscode.openWith', uri, targetEditor);
+      }
+    )
+  );
 }
 
 export function deactivate() {}

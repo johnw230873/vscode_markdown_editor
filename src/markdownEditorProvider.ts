@@ -4,6 +4,21 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 
 export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
+  /**
+   * Most recently activated custom-editor URI. Used by the
+   * `visualMarkdownEditor.toggleTextEditor` command to know which document to
+   * swap to a Text Editor when the user is focused inside the webview (where
+   * `vscode.window.activeTextEditor` is undefined).
+   */
+  private static activeUri: string | undefined;
+
+  /** Returns the URI of the currently-active visual editor, if any. */
+  static getActiveUri(): vscode.Uri | undefined {
+    return MarkdownEditorProvider.activeUri
+      ? vscode.Uri.parse(MarkdownEditorProvider.activeUri)
+      : undefined;
+  }
+
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   async resolveCustomTextEditor(
@@ -91,8 +106,30 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         case 'showInfo':
           vscode.window.showInformationMessage(message.text);
           return;
+
+        case 'toggleTextEditor': {
+          // User clicked the "Text Editor" button inside the webview.
+          // Delegate to the registered command so we have one code path.
+          vscode.commands.executeCommand('visualMarkdownEditor.toggleTextEditor', document.uri);
+          return;
+        }
       }
     });
+
+    // Track which custom editor is currently active so the toggle command can
+    // find the right URI when the user invokes it via keyboard shortcut while
+    // the webview has focus (where `activeTextEditor` is undefined).
+    webviewPanel.onDidChangeViewState((e) => {
+      if (e.webviewPanel.active) {
+        MarkdownEditorProvider.activeUri = document.uri.toString();
+      } else if (MarkdownEditorProvider.activeUri === document.uri.toString()) {
+        MarkdownEditorProvider.activeUri = undefined;
+      }
+    });
+    // If this is the first custom editor to open, mark it active immediately.
+    if (webviewPanel.active) {
+      MarkdownEditorProvider.activeUri = document.uri.toString();
+    }
 
     const changeDocumentSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
       if (e.document.uri.toString() === document.uri.toString() && e.contentChanges.length > 0) {
@@ -104,6 +141,9 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 
     webviewPanel.onDidDispose(() => {
       changeDocumentSubscription.dispose();
+      if (MarkdownEditorProvider.activeUri === document.uri.toString()) {
+        MarkdownEditorProvider.activeUri = undefined;
+      }
     });
 
     // Set HTML last — this triggers webview script execution
@@ -464,16 +504,12 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     </div>
   </div>
 
-  <div id="sourceContainer" style="display:none;">
-    <textarea id="sourceEditor" spellcheck="false"></textarea>
-  </div>
-
   <div id="statusBar">
     <span id="wordCount">Words: 0</span>
     <span id="charCount">Characters: 0</span>
     <span id="cursorPosition"></span>
     <span class="status-spacer"></span>
-    <button class="status-btn" id="toggleSourceBtn" title="Toggle Source View">&#x2328; Source</button>
+    <button class="status-btn" id="toggleTextEditorBtn" title="Switch to Text Editor (Ctrl+Alt+V) for raw markdown, Copilot Chat, and multi-cursor editing">&#x2328; Text Editor</button>
     <button class="status-btn" id="toggleNavBtn" title="Toggle Outline">&#x2630; Outline</button>
     <button class="status-btn" id="togglePageModeBtn" title="Toggle Page Mode">&#x1F4C4; Page</button>
     <span class="status-separator"></span>

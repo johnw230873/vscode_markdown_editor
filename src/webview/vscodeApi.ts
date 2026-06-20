@@ -16,7 +16,8 @@ export type VsCodeMessage =
   | { type: 'pasteImage'; data: string; mimeType: string }
   | { type: 'deleteImage'; relativePath: string }
   | { type: 'addCustomWord'; word: string }
-  | { type: 'showInfo'; text: string };
+  | { type: 'showInfo'; text: string }
+  | { type: 'toggleTextEditor' };
 
 export function postMessage(message: VsCodeMessage): void {
   vscode.postMessage(message);

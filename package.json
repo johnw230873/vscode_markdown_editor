@@ -39,6 +39,19 @@
       {
         "command": "visualMarkdownEditor.newDocument",
         "title": "Visual Markdown: New Document"
+      },
+      {
+        "command": "visualMarkdownEditor.toggleTextEditor",
+        "title": "Visual Markdown: Toggle Text Editor",
+        "shortTitle": "Toggle Text Editor"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "visualMarkdownEditor.toggleTextEditor",
+        "key": "ctrl+alt+v",
+        "mac": "cmd+alt+v",
+        "when": "editorLangId == markdown || activeCustomEditorId == 'visualMarkdownEditor.editor'"
       }
     ],
     "menus": {
@@ -47,6 +60,12 @@
           "command": "visualMarkdownEditor.openVisualEditor",
           "when": "resourceExtname == .md || resourceExtname == .markdown",
           "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "visualMarkdownEditor.toggleTextEditor",
+          "when": "editorLangId == markdown || activeCustomEditorId == 'visualMarkdownEditor.editor'"
         }
       ]
     }

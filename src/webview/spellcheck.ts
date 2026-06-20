@@ -66,7 +66,6 @@ export function getSuggestions(word: string, max: number = 6): string[] {
 let spellCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function requestSpellCheck(): void {
-  if (state.isSourceView) return;
   if (spellCheckTimer) clearTimeout(spellCheckTimer);
   spellCheckTimer = setTimeout(runSpellCheck, 300);
 }

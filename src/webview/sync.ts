@@ -4,7 +4,7 @@
 //   marks the document as dirty and triggers a sync.
 // - `updateWordCount()` refreshes the status-bar counters.
 
-import { state, editor, sourceEditor, wordCountEl, charCountEl } from './state';
+import { state, editor, wordCountEl, charCountEl } from './state';
 import { htmlToMarkdown } from './markdown';
 import { postMessage } from './vscodeApi';
 
@@ -15,9 +15,7 @@ export function scheduleSync(): void {
   if (!state.hasUserEdited) return;
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
-    const md = state.isSourceView
-      ? sourceEditor.value
-      : htmlToMarkdown(editor.innerHTML);
+    const md = htmlToMarkdown(editor.innerHTML);
     postMessage({ type: 'edit', content: md });
     updateWordCount(md);
   }, 500);

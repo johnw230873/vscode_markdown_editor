@@ -3,11 +3,10 @@
 // - Ctrl+K opens the link modal.
 // - Tab inside list items indents/outdents (instead of leaving the editor).
 
-import { state, editor, sourceEditor } from '../state';
-import { scheduleSync } from '../sync';
+import { state, editor } from '../state';
+import { scheduleSync, execCmd } from '../sync';
 import { scheduleNavRefresh } from './outline';
 import { requestSpellCheck } from '../spellcheck';
-import { execCmd } from '../sync';
 
 export function initInput(): void {
   // WYSIWYG input
@@ -16,12 +15,6 @@ export function initInput(): void {
     scheduleSync();
     scheduleNavRefresh();
     requestSpellCheck();
-  });
-
-  // Source-view input
-  sourceEditor.addEventListener('input', () => {
-    state.hasUserEdited = true;
-    scheduleSync();
   });
 
   // Keyboard shortcuts

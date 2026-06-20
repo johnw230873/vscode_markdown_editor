@@ -4,10 +4,7 @@
 // at module load and exported as `const`.
 
 export const editor = document.getElementById('editor') as HTMLElement;
-export const sourceEditor = document.getElementById('sourceEditor') as HTMLTextAreaElement;
 export const editorContainer = document.getElementById('editorContainer') as HTMLElement;
-export const editorWrapper = document.getElementById('editorWrapper') as HTMLElement;
-export const sourceContainer = document.getElementById('sourceContainer') as HTMLElement;
 export const wordCountEl = document.getElementById('wordCount') as HTMLElement;
 export const charCountEl = document.getElementById('charCount') as HTMLElement;
 export const navPane = document.getElementById('navPane') as HTMLElement;
@@ -27,7 +24,6 @@ export interface ContextMenuTarget {
 
 export const state = {
   // View mode flags
-  isSourceView: false,
   isUpdatingFromExtension: false,
   isNavVisible: false,
   hasUserEdited: false,

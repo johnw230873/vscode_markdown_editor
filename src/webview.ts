@@ -12,7 +12,7 @@ import { initToolbar } from './webview/features/toolbar';
 import { initColors } from './webview/features/colors';
 import { initInsert } from './webview/features/insert';
 import { initOutline } from './webview/features/outline';
-import { initSourceView, initCursorTracking } from './webview/features/sourceView';
+import { initCursorTracking } from './webview/features/cursorTracking';
 import { initImageTransfer } from './webview/features/imageTransfer';
 import { initZoom } from './webview/features/zoom';
 import { initImageTooltip } from './webview/features/imageTooltip';
@@ -20,6 +20,7 @@ import { initModals } from './webview/features/modals';
 import { initContextMenus } from './webview/features/contextMenus';
 import { initInput } from './webview/features/input';
 import { initMessages } from './webview/features/messages';
+import { initTextEditorToggle } from './webview/features/textEditorToggle';
 
 // Expose scheduleSync on window for inline onclick handlers in task-list
 // checkboxes (see markdown.ts -> markdownToHtml).
@@ -34,7 +35,6 @@ initToolbar();
 initColors();
 initInsert();
 initOutline();
-initSourceView();
 initImageTransfer();
 initZoom();
 initImageTooltip();
@@ -43,6 +43,7 @@ initContextMenus();
 initCursorTracking();
 initMessages();
 initInput();
+initTextEditorToggle();
 
 // Tell the extension host we're ready to receive the initial document.
 postMessage({ type: 'ready' });
