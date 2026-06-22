@@ -2,6 +2,7 @@ import { marked } from 'marked';
 import TurndownService from 'turndown';
 import { gfm } from 'turndown-plugin-gfm';
 import words from 'an-array-of-english-words';
+import mermaid from 'mermaid';
 
 declare function acquireVsCodeApi(): {
   postMessage(message: unknown): void;
@@ -72,6 +73,18 @@ marked.setOptions({
   breaks: true,
 });
 
+// ── Mermaid configuration ──
+{
+  const isDark = document.body.getAttribute('data-vscode-theme-kind')?.includes('dark') ||
+    document.body.classList.contains('vscode-dark') ||
+    document.body.classList.contains('vscode-high-contrast');
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: isDark ? 'dark' : 'default',
+    securityLevel: 'loose',
+  });
+}
+
 // ── Turndown configuration ──
 const turndownService = new TurndownService({
   headingStyle: 'atx',
@@ -84,6 +97,20 @@ const turndownService = new TurndownService({
   linkStyle: 'inlined',
 });
 turndownService.use(gfm);
+
+// Round-trip mermaid diagrams: convert rendered diagram divs back to ```mermaid fenced blocks
+turndownService.addRule('mermaidDiagram', {
+  filter: (node) => {
+    return node.nodeName === 'DIV' && (node as HTMLElement).classList.contains('mermaid-diagram');
+  },
+  replacement: (_content, node) => {
+    const el = node as HTMLElement;
+    const encoded = el.getAttribute('data-code') || '';
+    if (!encoded) return '';
+    const code = decodeURIComponent(escape(atob(encoded)));
+    return `\n\`\`\`mermaid\n${code}\n\`\`\`\n`;
+  },
+});
 
 // Keep style spans (colors, font-size, etc.)
 turndownService.addRule('styledSpan', {
@@ -177,6 +204,27 @@ turndownService.addRule('mark', {
   replacement: (content) => `<mark>${content}</mark>`,
 });
 
+// Keep sized images (preserve width style when resized) using Azure DevOps syntax
+turndownService.addRule('sizedImage', {
+  filter: (node) => {
+    if (node.nodeName !== 'IMG') return false;
+    const el = node as HTMLElement;
+    const style = el.getAttribute('style') || '';
+    return /width\s*:/.test(style);
+  },
+  replacement: (_content, node) => {
+    const el = node as HTMLImageElement;
+    const alt = el.getAttribute('alt') || '';
+    const src = el.getAttribute('src') || '';
+    const style = el.getAttribute('style') || '';
+    const widthMatch = style.match(/width\s*:\s*(\d+)px/);
+    if (widthMatch) {
+      return `![${alt}](${src} =${widthMatch[1]}x)`;
+    }
+    return `![${alt}](${src})`;
+  },
+});
+
 // ── DOM Elements ──
 const editor = document.getElementById('editor')!;
 const sourceEditor = document.getElementById('sourceEditor') as HTMLTextAreaElement;
@@ -256,20 +304,22 @@ pageModeBtn.addEventListener('click', () => {
 });
 
 // ── Zoom ──
-const zoomSlider = document.getElementById('zoomSlider') as HTMLInputElement;
-const zoomValue = document.getElementById('zoomValue')!;
+const zoomSlider = document.getElementById('zoomSlider') as HTMLInputElement | null;
+const zoomValue = document.getElementById('zoomValue');
 let currentZoom = 100;
 
 function setZoom(level: number) {
   currentZoom = Math.max(50, Math.min(200, level));
   editor.style.zoom = `${currentZoom}%`;
-  zoomSlider.value = String(currentZoom);
-  zoomValue.textContent = `${currentZoom}%`;
+  if (zoomSlider) zoomSlider.value = String(currentZoom);
+  if (zoomValue) zoomValue.textContent = `${currentZoom}%`;
 }
 
-zoomSlider.addEventListener('input', () => {
-  setZoom(parseInt(zoomSlider.value, 10));
-});
+if (zoomSlider) {
+  zoomSlider.addEventListener('input', () => {
+    setZoom(parseInt(zoomSlider.value, 10));
+  });
+}
 
 editorContainer.addEventListener('wheel', (e: WheelEvent) => {
   if (e.ctrlKey) {
@@ -281,7 +331,32 @@ editorContainer.addEventListener('wheel', (e: WheelEvent) => {
 
 // ── Markdown ↔ HTML conversion ──
 function markdownToHtml(md: string): string {
+  // Pre-process Azure DevOps image size syntax: ![alt](url =WIDTHx) or ![alt](url =WIDTHxHEIGHT)
+  md = md.replace(
+    /!\[([^\]]*)\]\(([^)]*?)\s+=([0-9]+)x([0-9]*)\)/g,
+    (_match, alt, src, width, _height) => {
+      return `<img src="${src.trim()}" alt="${alt}" width="${width}">`;
+    }
+  );
   let html = marked.parse(md) as string;
+  // Intercept mermaid code blocks before any other processing.
+  // marked renders them as <pre><code class="language-mermaid">…</code></pre>;
+  // replace with a placeholder div that stores the source so we can:
+  //   a) render via mermaid.render() after innerHTML is set
+  //   b) round-trip back to ```mermaid fenced blocks via the turndown rule
+  html = html.replace(
+    /<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/gi,
+    (_, rawCode) => {
+      const code = rawCode
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
+      const encoded = btoa(unescape(encodeURIComponent(code)));
+      return `<div class="mermaid-diagram" data-code="${encoded}" contenteditable="false"></div>`;
+    }
+  );
   // Convert task list items
   html = html.replace(
     /<li>\s*\[([ xX])\]\s*/g,
@@ -318,6 +393,20 @@ function markdownToHtml(md: string): string {
       }
     );
   }
+  // Convert width attribute to inline style for resized images
+  html = html.replace(
+    /<img\s([^>]*?)width="(\d+)"([^>]*?)>/gi,
+    (match, before, width, after) => {
+      // Remove the width attribute and add inline style
+      const cleanBefore = before.replace(/width="\d+"\s*/g, '');
+      const cleanAfter = after.replace(/width="\d+"\s*/g, '');
+      const existingStyle = match.match(/style="([^"]*)"/);
+      if (existingStyle) {
+        return match.replace(/style="([^"]*)"/, `style="$1; width: ${width}px; max-width: 100%; height: auto;"`);
+      }
+      return `<img ${cleanBefore}style="width: ${width}px; max-width: 100%; height: auto;"${cleanAfter}>`;
+    }
+  );
   return html;
 }
 
@@ -640,6 +729,28 @@ document.getElementById('inlineCodeBtn')!.addEventListener('click', () => {
 
 // Code block
 let savedCodeRange: Range | null = null;
+// Mermaid diagram button — inserts a sample diagram and renders it immediately
+document.getElementById('mermaidBtn')!.addEventListener('click', () => {
+  const sample = [
+    'flowchart LR',
+    '    A[Start] --> B{Decision}',
+    '    B -- Yes --> C[Do something]',
+    '    B -- No --> D[Do something else]',
+    '    C --> E[End]',
+    '    D --> E',
+  ].join('\n');
+  const encoded = btoa(unescape(encodeURIComponent(sample)));
+  const html =
+    `<div class="mermaid-diagram" data-code="${encoded}" contenteditable="false"></div>` +
+    `<p><em style="color:var(--vscode-descriptionForeground,#888);font-size:0.85em;">` +
+    `Switch to Source view (&#9000; Source) to edit this diagram.</em></p><p><br></p>`;
+  editor.focus();
+  document.execCommand('insertHTML', false, html);
+  hasUserEdited = true;
+  scheduleSync();
+  renderMermaidDiagrams();
+});
+
 document.getElementById('codeBlockBtn')!.addEventListener('click', () => {
   const sel = window.getSelection();
   if (sel && sel.rangeCount > 0) savedCodeRange = sel.getRangeAt(0).cloneRange();
@@ -676,6 +787,12 @@ document.getElementById('blockquoteBtn')!.addEventListener('click', () => {
 // Horizontal rule
 document.getElementById('hrBtn')!.addEventListener('click', () => {
   execCmd('insertHTML', '<hr><p><br></p>');
+});
+
+// Copilot context button — opens the linked plain-text editor so GitHub
+// Copilot agents can see this document and the current selection.
+document.getElementById('copilotContextBtn')!.addEventListener('click', () => {
+  vscode.postMessage({ type: 'openLinkedTextEditor' });
 });
 
 // Table button
@@ -826,6 +943,7 @@ document.getElementById('toggleSourceBtn')!.addEventListener('click', () => {
     sourceContainer.style.display = 'none';
     editorWrapper.style.display = 'flex';
     editor.focus();
+    renderMermaidDiagrams();
     scheduleNavRefresh();
   }
 });
@@ -936,6 +1054,26 @@ editor.addEventListener('keydown', (e: KeyboardEvent) => {
   }
 });
 
+// ── Mermaid rendering ──
+let mermaidCounter = 0;
+async function renderMermaidDiagrams(): Promise<void> {
+  const diagrams = editor.querySelectorAll<HTMLElement>('.mermaid-diagram[data-code]:not([data-rendered])');
+  for (const div of Array.from(diagrams)) {
+    const encoded = div.getAttribute('data-code') || '';
+    if (!encoded) continue;
+    const code = decodeURIComponent(escape(atob(encoded)));
+    const id = `mermaid-svg-${++mermaidCounter}`;
+    try {
+      const { svg } = await mermaid.render(id, code);
+      div.innerHTML = svg;
+      div.setAttribute('data-rendered', 'true');
+    } catch (err: any) {
+      div.innerHTML = `<pre class="mermaid-error" style="color:red;border:1px solid red;padding:8px;">Mermaid error: ${err?.message ?? err}</pre>`;
+      div.setAttribute('data-rendered', 'true');
+    }
+  }
+}
+
 // ── Message handling from extension ──
 window.addEventListener('message', (event) => {
   const message = event.data;
@@ -948,6 +1086,7 @@ window.addEventListener('message', (event) => {
         const scrollTop = editor.scrollTop;
         editor.innerHTML = html;
         editor.scrollTop = scrollTop;
+        renderMermaidDiagrams();
       } else {
         sourceEditor.value = message.content;
       }
@@ -978,6 +1117,40 @@ window.addEventListener('message', (event) => {
         const before = sourceEditor.value.substring(0, pos);
         const after = sourceEditor.value.substring(pos);
         sourceEditor.value = before + mdImage + after;
+        scheduleSync();
+      }
+      break;
+    }
+
+    case 'svgConverted': {
+      // Replace the SVG image element with the new PNG
+      const oldSrc = message.oldSrc as string;
+      const newSrc = message.newSrc as string;
+      const newMarkdownPath = message.newMarkdownPath as string;
+      const width = message.width as number;
+      const height = message.height as number;
+
+      if (!isSourceView) {
+        const imgs = editor.querySelectorAll('img');
+        for (const img of imgs) {
+          if (img.getAttribute('src') === oldSrc) {
+            img.setAttribute('src', newSrc);
+            img.removeAttribute('width');
+            img.removeAttribute('height');
+            img.removeAttribute('data-slash-prefix');
+            img.setAttribute('style', 'max-width: 100%; height: auto;');
+            break;
+          }
+        }
+        hasUserEdited = true;
+        scheduleSync();
+      } else {
+        // In source mode, replace the markdown image reference
+        const oldRelativePath = message.oldRelativePath as string;
+        sourceEditor.value = sourceEditor.value.replace(
+          new RegExp(`!\\[([^\\]]*)\\]\\(${oldRelativePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`),
+          `![$1](${newMarkdownPath})`
+        );
         scheduleSync();
       }
       break;
@@ -1013,6 +1186,65 @@ document.addEventListener('keydown', (e) => {
 // ── Track heading/format state for toolbar ──
 editor.addEventListener('keyup', updateToolbarState);
 editor.addEventListener('mouseup', updateToolbarState);
+
+// ── Selection tracking (exposes cursor/selection to GitHub Copilot agents) ──
+let selectionReportTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Track whether the webview currently has focus.
+// When focus leaves (e.g. the user opens Copilot Chat), the browser fires a
+// selectionchange with an empty selection.  Without this guard we would
+// overwrite the linked text editor's selection with nothing, making Copilot
+// see no selected text.
+let webviewHasFocus = true;
+window.addEventListener('focus', () => { webviewHasFocus = true; });
+window.addEventListener('blur',  () => { webviewHasFocus = false; });
+
+function reportSelection() {
+  if (isUpdatingFromExtension) return;
+  // Do NOT send anything while the webview is unfocused — preserve the last
+  // known selection in the linked text editor so Copilot can still read it.
+  if (!webviewHasFocus) return;
+
+  if (isSourceView) {
+    const start = sourceEditor.selectionStart;
+    const end = sourceEditor.selectionEnd;
+    vscode.postMessage({
+      type: 'selectionChange',
+      startOffset: start,
+      endOffset: end,
+      selectedText: sourceEditor.value.substring(start, end),
+    });
+    return;
+  }
+
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !editor.contains(sel.focusNode)) {
+    // Only clear the selection when we're sure focus is still here
+    if (webviewHasFocus) {
+      vscode.postMessage({ type: 'selectionChange', startOffset: 0, endOffset: 0, selectedText: '' });
+    }
+    return;
+  }
+
+  const selectedText = sel.toString();
+  const md = htmlToMarkdown(editor.innerHTML);
+  const startOffset = getSourceCharOffsetForCursor(md);
+  // End offset approximation: markdown may differ from plain text by syntax chars,
+  // but this is accurate enough for Copilot to locate the right region.
+  const endOffset = sel.isCollapsed ? startOffset : startOffset + selectedText.length;
+
+  vscode.postMessage({
+    type: 'selectionChange',
+    startOffset,
+    endOffset,
+    selectedText,
+  });
+}
+
+document.addEventListener('selectionchange', () => {
+  if (selectionReportTimer) clearTimeout(selectionReportTimer);
+  selectionReportTimer = setTimeout(reportSelection, 150);
+});
 
 // ── Scroll-spy: highlight active heading in nav ──
 editorContainer.addEventListener('scroll', () => {
@@ -1300,9 +1532,179 @@ function getImageRelativePath(img: HTMLImageElement): string {
   if (baseUri && src.startsWith(baseUri + '/')) {
     relativePath = src.slice(baseUri.length + 1);
   } else if (attachmentsBaseUri && src.startsWith(attachmentsBaseUri + '/')) {
-    relativePath = src.slice(attachmentsBaseUri.length + 1);
+    // Image is from the parent directory — prefix with '/' so the provider
+    // knows to resolve relative to the parent (e.g. /.attachments/img.png)
+    relativePath = '/' + src.slice(attachmentsBaseUri.length + 1);
   }
   return relativePath;
+}
+
+function isSvgImage(img: HTMLImageElement): boolean {
+  const src = img.getAttribute('src') || '';
+  return src.toLowerCase().endsWith('.svg');
+}
+
+function convertSvgToPng(img: HTMLImageElement, width: number, height: number): void {
+  const svgRelativePath = getImageRelativePath(img);
+  // Send just the path — the extension host renders via headless browser
+  // (canvas can't render SVGs that contain <foreignObject>, e.g. Mermaid diagrams)
+  vscode.postMessage({
+    type: 'convertSvgToPng',
+    svgRelativePath,
+    pngData: '',
+    width,
+    height,
+  });
+}
+
+function showConvertSvgDialog(img: HTMLImageElement): void {
+  const displayWidth = img.clientWidth || img.naturalWidth || 300;
+  const displayHeight = img.clientHeight || img.naturalHeight || 300;
+
+  // Create modal overlay
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;';
+
+  const dialog = document.createElement('div');
+  dialog.style.cssText = 'background:var(--vscode-editor-background, #1e1e1e);color:var(--vscode-editor-foreground, #ccc);border:1px solid var(--vscode-widget-border, #444);border-radius:6px;padding:20px;min-width:280px;font-family:var(--vscode-font-family, sans-serif);';
+
+  dialog.innerHTML = `
+    <h3 style="margin:0 0 12px 0;font-size:14px;">Convert SVG to PNG</h3>
+    <div style="margin-bottom:10px;">
+      <label style="display:block;margin-bottom:4px;font-size:12px;">Width (px):</label>
+      <input id="svgConvertWidth" type="number" value="${displayWidth}" min="1" max="4096"
+        style="width:100%;padding:4px 8px;background:var(--vscode-input-background, #3c3c3c);color:var(--vscode-input-foreground, #ccc);border:1px solid var(--vscode-input-border, #555);border-radius:3px;">
+    </div>
+    <div style="margin-bottom:10px;">
+      <label style="display:block;margin-bottom:4px;font-size:12px;">Height (px):</label>
+      <input id="svgConvertHeight" type="number" value="${displayHeight}" min="1" max="4096"
+        style="width:100%;padding:4px 8px;background:var(--vscode-input-background, #3c3c3c);color:var(--vscode-input-foreground, #ccc);border:1px solid var(--vscode-input-border, #555);border-radius:3px;">
+    </div>
+    <div style="margin-bottom:12px;">
+      <label style="font-size:12px;">
+        <input id="svgConvertLockRatio" type="checkbox" checked> Lock aspect ratio
+      </label>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button id="svgConvertCancel" style="padding:4px 12px;background:transparent;color:var(--vscode-button-secondaryForeground, #ccc);border:1px solid var(--vscode-button-secondaryBorder, #555);border-radius:3px;cursor:pointer;">Cancel</button>
+      <button id="svgConvertOk" style="padding:4px 12px;background:var(--vscode-button-background, #0e639c);color:var(--vscode-button-foreground, #fff);border:none;border-radius:3px;cursor:pointer;">Convert</button>
+    </div>
+  `;
+
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  const widthInput = dialog.querySelector('#svgConvertWidth') as HTMLInputElement;
+  const heightInput = dialog.querySelector('#svgConvertHeight') as HTMLInputElement;
+  const lockRatio = dialog.querySelector('#svgConvertLockRatio') as HTMLInputElement;
+  const cancelBtn = dialog.querySelector('#svgConvertCancel') as HTMLButtonElement;
+  const okBtn = dialog.querySelector('#svgConvertOk') as HTMLButtonElement;
+
+  const aspectRatio = displayWidth / displayHeight;
+
+  widthInput.addEventListener('input', () => {
+    if (lockRatio.checked) {
+      heightInput.value = String(Math.round(parseInt(widthInput.value) / aspectRatio) || 1);
+    }
+  });
+  heightInput.addEventListener('input', () => {
+    if (lockRatio.checked) {
+      widthInput.value = String(Math.round(parseInt(heightInput.value) * aspectRatio) || 1);
+    }
+  });
+
+  cancelBtn.addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  okBtn.addEventListener('click', () => {
+    const w = parseInt(widthInput.value) || displayWidth;
+    const h = parseInt(heightInput.value) || displayHeight;
+    overlay.remove();
+    convertSvgToPng(img, w, h);
+  });
+
+  widthInput.focus();
+  widthInput.select();
+}
+
+function showImageResizeDialog(img: HTMLImageElement): void {
+  // Determine current size as percentage of natural width (or 100% if unknown)
+  const naturalW = img.naturalWidth || img.clientWidth || 300;
+  const currentW = img.clientWidth || naturalW;
+  const currentPercent = Math.round((currentW / naturalW) * 100);
+
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;';
+
+  const dialog = document.createElement('div');
+  dialog.style.cssText = 'background:var(--vscode-editor-background, #1e1e1e);color:var(--vscode-editor-foreground, #ccc);border:1px solid var(--vscode-widget-border, #444);border-radius:6px;padding:20px;min-width:300px;font-family:var(--vscode-font-family, sans-serif);';
+
+  dialog.innerHTML = `
+    <h3 style="margin:0 0 12px 0;font-size:14px;">Resize Image</h3>
+    <div style="margin-bottom:8px;font-size:12px;opacity:0.7;">Original: ${naturalW}px wide</div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+      <input id="imgResizeSlider" type="range" min="5" max="100" value="${currentPercent}"
+        style="flex:1;cursor:pointer;">
+      <span id="imgResizeValue" style="min-width:42px;text-align:right;font-size:13px;font-weight:bold;">${currentPercent}%</span>
+    </div>
+    <div style="margin-bottom:16px;text-align:center;">
+      <img id="imgResizePreview" src="${img.src}" style="max-width:100%;width:${currentPercent}%;border:1px solid var(--vscode-widget-border, #444);border-radius:3px;max-height:200px;object-fit:contain;">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button id="imgResizeReset" style="padding:4px 12px;background:transparent;color:var(--vscode-button-secondaryForeground, #ccc);border:1px solid var(--vscode-button-secondaryBorder, #555);border-radius:3px;cursor:pointer;margin-right:auto;">Reset (100%)</button>
+      <button id="imgResizeCancel" style="padding:4px 12px;background:transparent;color:var(--vscode-button-secondaryForeground, #ccc);border:1px solid var(--vscode-button-secondaryBorder, #555);border-radius:3px;cursor:pointer;">Cancel</button>
+      <button id="imgResizeOk" style="padding:4px 12px;background:var(--vscode-button-background, #0e639c);color:var(--vscode-button-foreground, #fff);border:none;border-radius:3px;cursor:pointer;">Apply</button>
+    </div>
+  `;
+
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  const slider = dialog.querySelector('#imgResizeSlider') as HTMLInputElement;
+  const valueLabel = dialog.querySelector('#imgResizeValue') as HTMLElement;
+  const preview = dialog.querySelector('#imgResizePreview') as HTMLImageElement;
+  const cancelBtn = dialog.querySelector('#imgResizeCancel') as HTMLButtonElement;
+  const okBtn = dialog.querySelector('#imgResizeOk') as HTMLButtonElement;
+  const resetBtn = dialog.querySelector('#imgResizeReset') as HTMLButtonElement;
+
+  slider.addEventListener('input', () => {
+    const pct = slider.value;
+    valueLabel.textContent = pct + '%';
+    preview.style.width = pct + '%';
+  });
+
+  resetBtn.addEventListener('click', () => {
+    slider.value = '100';
+    valueLabel.textContent = '100%';
+    preview.style.width = '100%';
+  });
+
+  cancelBtn.addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  okBtn.addEventListener('click', () => {
+    const pct = parseInt(slider.value);
+    if (pct >= 100) {
+      // Full size — remove explicit width constraint
+      img.style.width = '';
+      img.style.maxWidth = '100%';
+      img.style.height = 'auto';
+      img.removeAttribute('width');
+      img.removeAttribute('height');
+    } else {
+      const newWidth = Math.round(naturalW * (pct / 100));
+      img.style.width = newWidth + 'px';
+      img.style.maxWidth = '100%';
+      img.style.height = 'auto';
+      img.removeAttribute('width');
+      img.removeAttribute('height');
+    }
+    overlay.remove();
+    hasUserEdited = true;
+    scheduleSync();
+  });
+
+  slider.focus();
 }
 
 function showImageContextMenu(img: HTMLImageElement, x: number, y: number) {
@@ -1311,6 +1713,35 @@ function showImageContextMenu(img: HTMLImageElement, x: number, y: number) {
   menu.className = 'context-menu';
   menu.style.left = x + 'px';
   menu.style.top = y + 'px';
+
+  // Resize image (not available for SVGs - they don't have meaningful pixel dimensions)
+  if (!isSvgImage(img)) {
+    const resizeItem = document.createElement('button');
+    resizeItem.className = 'context-menu-item';
+    resizeItem.textContent = 'Resize Image';
+    resizeItem.addEventListener('click', () => {
+      removeContextMenu();
+      showImageResizeDialog(img);
+    });
+    menu.appendChild(resizeItem);
+  }
+
+  // Convert SVG to PNG (only for SVG images)
+  if (isSvgImage(img)) {
+    const convertItem = document.createElement('button');
+    convertItem.className = 'context-menu-item';
+    convertItem.textContent = 'Convert to PNG';
+    convertItem.addEventListener('click', () => {
+      removeContextMenu();
+      showConvertSvgDialog(img);
+    });
+    menu.appendChild(convertItem);
+  }
+
+  // Divider before destructive actions
+  const imgDivider = document.createElement('div');
+  imgDivider.className = 'context-menu-divider';
+  menu.appendChild(imgDivider);
 
   // Delete image (remove from document only)
   const deleteItem = document.createElement('button');

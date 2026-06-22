@@ -6,6 +6,69 @@ import * as fs from 'fs';
 export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
   constructor(private readonly context: vscode.ExtensionContext) {}
 
+  // Tracks the linked plain-text editor (for GitHub Copilot / agent context) per document URI.
+  static readonly linkedEditors = new Map<string, vscode.TextEditor>();
+
+  // The document currently active in a visual editor panel.
+  static activeDocument: vscode.TextDocument | undefined;
+
+  // Fires whenever the active visual editor document changes (used by the status bar).
+  static readonly onActiveDocumentChanged =
+    new vscode.EventEmitter<vscode.TextDocument | undefined>();
+
+  /**
+   * Opens the markdown source file as a standard text editor beside the visual editor.
+   * Copilot agents read from this text editor for document content and selection context.
+   */
+  static async openLinkedTextEditor(document: vscode.TextDocument): Promise<void> {
+    const editor = await vscode.window.showTextDocument(document, {
+      viewColumn: vscode.ViewColumn.Beside,
+      preserveFocus: true,
+      preview: false,
+    });
+    MarkdownEditorProvider.linkedEditors.set(document.uri.toString(), editor);
+  }
+
+  /**
+   * Focuses the linked text editor so Copilot sees it as the active editor.
+   * Call this before invoking Copilot inline-chat or asking an agent question.
+   */
+  static async focusLinkedTextEditor(document: vscode.TextDocument): Promise<void> {
+    const uriKey = document.uri.toString();
+    const existing = MarkdownEditorProvider.getLinkedEditor(uriKey);
+    if (existing) {
+      await vscode.window.showTextDocument(existing.document, {
+        viewColumn: existing.viewColumn,
+        preserveFocus: false,
+      });
+    } else {
+      // Open it first (with focus this time)
+      const editor = await vscode.window.showTextDocument(document, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus: false,
+        preview: false,
+      });
+      MarkdownEditorProvider.linkedEditors.set(uriKey, editor);
+    }
+  }
+
+  /** Returns the current linked editor if it is still visible, cleaning up stale entries. */
+  private static getLinkedEditor(uriKey: string): vscode.TextEditor | undefined {
+    // Check ALL visible text editors, not just ones we opened ourselves.
+    // This prevents opening a duplicate panel when the file was already open
+    // as a plain text editor before the visual editor was activated.
+    const current = vscode.window.visibleTextEditors.find(
+      (e) => e.document.uri.toString() === uriKey
+    );
+    if (!current) {
+      MarkdownEditorProvider.linkedEditors.delete(uriKey);
+      return undefined;
+    }
+    // Keep the map in sync so selection updates reach the right editor.
+    MarkdownEditorProvider.linkedEditors.set(uriKey, current);
+    return current;
+  }
+
   async resolveCustomTextEditor(
     document: vscode.TextDocument,
     webviewPanel: vscode.WebviewPanel,
@@ -73,8 +136,37 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
           return;
         }
 
+        case 'selectionChange': {
+          // Sync the selection into the linked text editor so Copilot can see it.
+          const uriKey = document.uri.toString();
+          const linked = MarkdownEditorProvider.getLinkedEditor(uriKey);
+          if (linked) {
+            try {
+              const startPos = document.positionAt(
+                Math.max(0, Math.min(message.startOffset as number, document.getText().length))
+              );
+              const endPos = document.positionAt(
+                Math.max(0, Math.min(message.endOffset as number, document.getText().length))
+              );
+              const sel = new vscode.Selection(startPos, endPos);
+              linked.selection = sel;
+              if (!sel.isEmpty) {
+                linked.revealRange(sel, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+              }
+            } catch {
+              // Document was modified mid-flight; ignore.
+            }
+          }
+          return;
+        }
+
         case 'insertImage': {
           this.handleInsertImage(document, webviewPanel);
+          return;
+        }
+
+        case 'openLinkedTextEditor': {
+          MarkdownEditorProvider.openLinkedTextEditor(document);
           return;
         }
 
@@ -85,6 +177,18 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 
         case 'deleteImage': {
           this.handleDeleteImage(document, message.relativePath);
+          return;
+        }
+
+        case 'convertSvgToPng': {
+          this.handleConvertSvgToPng(
+            document,
+            webviewPanel,
+            message.svgRelativePath,
+            message.pngData,
+            message.width,
+            message.height
+          );
           return;
         }
 
@@ -102,12 +206,32 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       }
     });
 
+    webviewPanel.onDidChangeViewState(() => {
+      if (webviewPanel.active) {
+        MarkdownEditorProvider.activeDocument = document;
+      } else if (MarkdownEditorProvider.activeDocument === document) {
+        MarkdownEditorProvider.activeDocument = undefined;
+      }
+      MarkdownEditorProvider.onActiveDocumentChanged.fire(MarkdownEditorProvider.activeDocument);
+    });
+
     webviewPanel.onDidDispose(() => {
       changeDocumentSubscription.dispose();
+      MarkdownEditorProvider.linkedEditors.delete(document.uri.toString());
+      if (MarkdownEditorProvider.activeDocument === document) {
+        MarkdownEditorProvider.activeDocument = undefined;
+        MarkdownEditorProvider.onActiveDocumentChanged.fire(undefined);
+      }
     });
 
     // Set HTML last — this triggers webview script execution
     webviewPanel.webview.html = this.getHtmlForWebview(webviewPanel.webview, document);
+
+    // Fire the initial active-document event so the status bar shows as soon
+    // as the panel opens (onDidChangeViewState only fires on *changes*, not
+    // on the initial open).
+    MarkdownEditorProvider.activeDocument = document;
+    MarkdownEditorProvider.onActiveDocumentChanged.fire(document);
   }
 
   private async handleInsertImage(
@@ -163,6 +287,12 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     relativePath: string
   ): Promise<void> {
     try {
+      // Reject paths that are still full URIs (image was not under a known base directory)
+      if (!relativePath || relativePath.includes('://')) {
+        vscode.window.showErrorMessage('Cannot delete image: file is not in a recognized location relative to the document.');
+        return;
+      }
+
       const docDir = path.dirname(document.uri.fsPath);
       let filePath: string;
 
@@ -175,9 +305,87 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       }
 
       const fileUri = vscode.Uri.file(filePath);
-      await vscode.workspace.fs.delete(fileUri);
+      await vscode.workspace.fs.delete(fileUri, { useTrash: true });
     } catch (e) {
       vscode.window.showErrorMessage(`Failed to delete image: ${e}`);
+    }
+  }
+
+  private async handleConvertSvgToPng(
+    document: vscode.TextDocument,
+    webviewPanel: vscode.WebviewPanel,
+    svgRelativePath: string,
+    pngData: string,
+    width: number,
+    height: number
+  ): Promise<void> {
+    try {
+      if (!svgRelativePath || svgRelativePath.includes('://')) {
+        vscode.window.showErrorMessage('Cannot convert: SVG file is not in a recognized location.');
+        return;
+      }
+
+      const docDir = path.dirname(document.uri.fsPath);
+      let svgFilePath: string;
+
+      if (svgRelativePath.startsWith('/.attachments/') || svgRelativePath.startsWith('/.attachments\\')) {
+        const parentDir = path.dirname(docDir);
+        svgFilePath = path.join(parentDir, svgRelativePath.slice(1));
+      } else {
+        svgFilePath = path.join(docDir, svgRelativePath);
+      }
+
+      // Save PNG in the same directory as the SVG
+      const svgDir = path.dirname(svgFilePath);
+      const svgBaseName = path.basename(svgFilePath, path.extname(svgFilePath));
+      const pngFileName = `${svgBaseName}-${Date.now()}.png`;
+      const pngFilePath = path.join(svgDir, pngFileName);
+
+      // Use Puppeteer (headless browser) to render — supports SVGs with
+      // <foreignObject>/embedded HTML that canvas cannot render.
+      await renderSvgToPngWithBrowser(svgFilePath, pngFilePath, width, height);
+
+      // Delete the source SVG
+      try {
+        await vscode.workspace.fs.delete(vscode.Uri.file(svgFilePath));
+      } catch {
+        vscode.window.showWarningMessage('PNG saved but failed to delete original SVG file.');
+      }
+
+      // Build the new relative path for the PNG (same structure as SVG path)
+      let pngRelativePath: string;
+      if (svgRelativePath.startsWith('/.attachments/') || svgRelativePath.startsWith('/.attachments\\')) {
+        pngRelativePath = '/.attachments/' + pngFileName;
+      } else {
+        const svgRelativeDir = path.dirname(svgRelativePath);
+        pngRelativePath = svgRelativeDir === '.' ? pngFileName : `${svgRelativeDir}/${pngFileName}`;
+      }
+
+      // Build the webview URI for the old SVG (to find it in the DOM) and new PNG
+      const baseUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(docDir)).toString();
+      const parentDir = path.dirname(docDir);
+      const attachmentsBaseUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(parentDir)).toString();
+
+      let oldSrc: string;
+      if (svgRelativePath.startsWith('/.attachments/') || svgRelativePath.startsWith('/.attachments\\')) {
+        oldSrc = `${attachmentsBaseUri}/${svgRelativePath.slice(1)}`;
+      } else {
+        oldSrc = `${baseUri}/${svgRelativePath}`;
+      }
+
+      const newSrc = webviewPanel.webview.asWebviewUri(vscode.Uri.file(pngFilePath)).toString();
+
+      webviewPanel.webview.postMessage({
+        type: 'svgConverted',
+        oldSrc,
+        newSrc,
+        oldRelativePath: svgRelativePath,
+        newMarkdownPath: pngRelativePath,
+        width,
+        height,
+      });
+    } catch (e) {
+      vscode.window.showErrorMessage(`Failed to convert SVG to PNG: ${e}`);
     }
   }
 
@@ -250,6 +458,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 
   private getHtmlForWebview(webview: vscode.Webview, document: vscode.TextDocument): string {
     const nonce = crypto.randomBytes(16).toString('hex');
+    const isSvg = path.extname(document.uri.fsPath).toLowerCase() === '.svg';
 
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'dist', 'webview.js')
@@ -270,7 +479,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data: blob:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data: blob:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval'; font-src ${webview.cspSource};">
   <link href="${styleUri}" rel="stylesheet">
   <title>Visual Markdown Editor</title>
 </head>
@@ -375,12 +584,17 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       <div class="toolbar-group">
         <button class="toolbar-btn" id="inlineCodeBtn" title="Inline Code">&lt;/&gt;</button>
         <button class="toolbar-btn" id="codeBlockBtn" title="Insert Code Block">&#x2338; Code</button>
+        <button class="toolbar-btn" id="mermaidBtn" title="Insert Mermaid Diagram">&#x25C7; Mermaid</button>
       </div>
       <div class="toolbar-separator"></div>
       <div class="toolbar-group">
         <button class="toolbar-btn" id="blockquoteBtn" title="Blockquote">&#x275D;</button>
         <button class="toolbar-btn" id="hrBtn" title="Horizontal Rule">&#x2015;</button>
         <button class="toolbar-btn" id="tableBtn" title="Insert Table">&#x25A6; Table</button>
+      </div>
+      <div class="toolbar-separator"></div>
+      <div class="toolbar-group">
+        <button class="toolbar-btn" id="copilotContextBtn" title="Open linked text editor so GitHub Copilot agents can see this document and your selection">&#x1F4CB; Copilot</button>
       </div>
     </div>
   </div>
@@ -441,6 +655,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
             <option value="markdown">Markdown</option>
             <option value="powershell">PowerShell</option>
             <option value="terraform">Terraform</option>
+            <option value="mermaid">Mermaid Diagram</option>
           </select>
         </label>
       </div>
@@ -477,9 +692,9 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     <button class="status-btn" id="toggleNavBtn" title="Toggle Outline">&#x2630; Outline</button>
     <button class="status-btn" id="togglePageModeBtn" title="Toggle Page Mode">&#x1F4C4; Page</button>
     <span class="status-separator"></span>
-    <label class="zoom-label" for="zoomSlider">&#x1F50D;</label>
+    ${isSvg ? '' : `<label class="zoom-label" for="zoomSlider">&#x1F50D;</label>
     <input type="range" id="zoomSlider" min="50" max="200" value="100" step="10" title="Zoom">
-    <span id="zoomValue">100%</span>
+    <span id="zoomValue">100%</span>`}
   </div>
 
   <script nonce="${nonce}">
@@ -490,4 +705,78 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 </body>
 </html>`;
   }
+}
+
+async function renderSvgToPngWithBrowser(svgPath: string, pngPath: string, width: number, height: number): Promise<void> {
+  const puppeteer = require('puppeteer-core');
+  const browserPath = findBrowserPath();
+  if (!browserPath) {
+    throw new Error('Could not find Chrome or Edge. Install Google Chrome or Microsoft Edge to convert SVG to PNG.');
+  }
+
+  const svgContent = fs.readFileSync(svgPath, 'utf8');
+
+  // Use provided dimensions, fall back to viewBox
+  let renderWidth = width;
+  let renderHeight = height;
+  if (!renderWidth || !renderHeight) {
+    const viewBoxMatch = svgContent.match(/viewBox="[\d.]+ [\d.]+ ([\d.]+) ([\d.]+)"/);
+    renderWidth = viewBoxMatch ? Math.ceil(parseFloat(viewBoxMatch[1])) : 1400;
+    renderHeight = viewBoxMatch ? Math.ceil(parseFloat(viewBoxMatch[2])) : 700;
+  }
+
+  const browser = await puppeteer.launch({
+    executablePath: browserPath,
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: renderWidth + 40, height: renderHeight + 40, deviceScaleFactor: 2 });
+
+    const html = `<!DOCTYPE html>
+<html><head><style>
+body { margin: 0; padding: 20px; background: white; }
+svg { display: block; width: ${renderWidth}px; height: ${renderHeight}px; }
+</style></head><body>${svgContent}</body></html>`;
+
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+
+    const svgElement = await page.$('svg');
+    if (svgElement) {
+      await svgElement.screenshot({ path: pngPath, type: 'png' });
+    } else {
+      await page.screenshot({ path: pngPath, type: 'png', fullPage: true });
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+function findBrowserPath(): string | undefined {
+  const candidates = process.platform === 'win32'
+    ? [
+        (process.env['PROGRAMFILES(X86)'] ?? '') + '\\Microsoft\\Edge\\Application\\msedge.exe',
+        (process.env['PROGRAMFILES'] ?? '') + '\\Microsoft\\Edge\\Application\\msedge.exe',
+        (process.env['PROGRAMFILES'] ?? '') + '\\Google\\Chrome\\Application\\chrome.exe',
+        (process.env['PROGRAMFILES(X86)'] ?? '') + '\\Google\\Chrome\\Application\\chrome.exe',
+        (process.env['LOCALAPPDATA'] ?? '') + '\\Google\\Chrome\\Application\\chrome.exe',
+      ]
+    : process.platform === 'darwin'
+    ? [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      ]
+    : [
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/snap/bin/chromium',
+        '/usr/bin/microsoft-edge',
+        '/usr/bin/microsoft-edge-stable',
+      ];
+
+  return candidates.find(p => p && fs.existsSync(p));
 }
