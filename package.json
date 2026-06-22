@@ -2,7 +2,7 @@
   "name": "visual-markdown-editor",
   "displayName": "Visual Markdown Editor",
   "description": "A feature-rich WYSIWYG markdown editor for VS Code with image management, formatting, colors, and tables",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "local",
   "engines": {
     "vscode": "^1.80.0"
