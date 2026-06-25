@@ -526,7 +526,11 @@ body {
   height: auto;
   border-radius: 3px;
   margin: 8px 0;
-  cursor: default;
+  cursor: grab;
+}
+
+#editor img:active {
+  cursor: grabbing;
 }
 
 #editor blockquote {

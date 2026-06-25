@@ -2,7 +2,7 @@
   "name": "visual-markdown-editor",
   "displayName": "Visual Markdown Editor",
   "description": "A feature-rich WYSIWYG markdown editor for VS Code with image management, formatting, colors, and tables",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "local",
   "engines": {
     "vscode": "^1.80.0"
@@ -84,6 +84,7 @@
   },
   "dependencies": {
     "an-array-of-english-words": "^2.0.0",
+    "html-to-docx": "^1.8.0",
     "marked": "^12.0.0",
     "mermaid": "^11.15.0",
     "puppeteer-core": "^24.43.1",

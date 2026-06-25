@@ -795,6 +795,15 @@ document.getElementById('copilotContextBtn')!.addEventListener('click', () => {
   vscode.postMessage({ type: 'openLinkedTextEditor' });
 });
 
+// Export buttons
+document.getElementById('exportPdfBtn')!.addEventListener('click', () => {
+  vscode.postMessage({ type: 'exportPdf', isDark: false });
+});
+
+document.getElementById('exportDocxBtn')!.addEventListener('click', () => {
+  vscode.postMessage({ type: 'exportDocx' });
+});
+
 // Table button
 let savedTableRange: Range | null = null;
 
@@ -948,6 +957,59 @@ document.getElementById('toggleSourceBtn')!.addEventListener('click', () => {
   }
 });
 
+// ── Copy with embedded images (for paste into Word / external apps) ──
+// When the selection contains images, intercept copy and replace each webview-resource
+// URI with a base64 data URL so external apps (e.g. Word) can render them.
+editor.addEventListener('copy', (e: ClipboardEvent) => {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return;
+
+  const range = selection.getRangeAt(0);
+  const fragment = range.cloneContents();
+  const clonedImgs = Array.from(fragment.querySelectorAll('img')) as HTMLImageElement[];
+
+  // No images in selection — let the browser handle the copy normally
+  if (clonedImgs.length === 0) return;
+
+  e.preventDefault();
+
+  // Build a lookup of live DOM images by src so we can draw them (cloned nodes
+  // are not rendered and may not have naturalWidth/Height set).
+  const liveImgMap = new Map<string, HTMLImageElement>();
+  (Array.from(editor.querySelectorAll('img')) as HTMLImageElement[]).forEach((li) => {
+    const s = li.getAttribute('src');
+    if (s) liveImgMap.set(s, li);
+  });
+
+  clonedImgs.forEach((clonedImg) => {
+    const srcAttr = clonedImg.getAttribute('src') || '';
+    const liveImg = liveImgMap.get(srcAttr);
+    const source = liveImg ?? clonedImg;
+
+    const w = source.naturalWidth || source.clientWidth || 300;
+    const h = source.naturalHeight || source.clientHeight || 300;
+    const canvas = document.createElement('canvas');
+    canvas.width = w || 300;
+    canvas.height = h || 300;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      try {
+        ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+        clonedImg.src = canvas.toDataURL('image/png');
+        clonedImg.removeAttribute('data-slash-prefix');
+        clonedImg.style.maxWidth = '';
+      } catch {
+        // Tainted canvas (e.g. cross-origin image) — leave original src
+      }
+    }
+  });
+
+  const container = document.createElement('div');
+  container.appendChild(fragment);
+  e.clipboardData!.setData('text/html', container.innerHTML);
+  e.clipboardData!.setData('text/plain', selection.toString());
+});
+
 // ── Image paste handling ──
 editor.addEventListener('paste', (e: ClipboardEvent) => {
   const items = e.clipboardData?.items;
@@ -976,10 +1038,31 @@ editor.addEventListener('paste', (e: ClipboardEvent) => {
   }
 });
 
-// ── Image drag & drop handling ──
+// ── Shared drag utilities ──
+function getCaretRangeAt(x: number, y: number): Range | null {
+  if ((document as any).caretPositionFromPoint) {
+    const pos = (document as any).caretPositionFromPoint(x, y);
+    if (pos) {
+      const r = document.createRange();
+      r.setStart(pos.offsetNode, pos.offset);
+      r.collapse(true);
+      return r;
+    }
+  } else if ((document as any).caretRangeFromPoint) {
+    return (document as any).caretRangeFromPoint(x, y);
+  }
+  return null;
+}
+
+// Range of text currently being dragged (captured in dragstart, consumed in drop)
+let savedDragRange: Range | null = null;
+
+// ── Image / file drag & drop + text drag handling ──
 editor.addEventListener('dragover', (e: DragEvent) => {
-  e.preventDefault();
-  editor.classList.add('drag-over');
+  e.preventDefault(); // required to allow drop
+  // Only highlight the editor border for external file drops, not internal text drags
+  const hasFiles = e.dataTransfer?.types.includes('Files');
+  editor.classList.toggle('drag-over', !!hasFiles);
 });
 
 editor.addEventListener('dragleave', () => {
@@ -987,29 +1070,177 @@ editor.addEventListener('dragleave', () => {
 });
 
 editor.addEventListener('drop', (e: DragEvent) => {
-  e.preventDefault();
   editor.classList.remove('drag-over');
 
   const files = e.dataTransfer?.files;
-  if (!files || files.length === 0) return;
-
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    if (file.type.startsWith('image/')) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        const base64 = result.split(',')[1];
-        vscode.postMessage({
-          type: 'pasteImage',
-          data: base64,
-          mimeType: file.type,
-        });
-      };
-      reader.readAsDataURL(file);
+  if (files && files.length > 0) {
+    // External file drop — handle ourselves
+    e.preventDefault();
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = reader.result as string;
+          const base64 = result.split(',')[1];
+          vscode.postMessage({
+            type: 'pasteImage',
+            data: base64,
+            mimeType: file.type,
+          });
+        };
+        reader.readAsDataURL(file);
+      }
     }
+  } else if (savedDragRange) {
+    // Internal text drag — manually extract and reinsert so it works reliably
+    e.preventDefault();
+    const dropRange = getCaretRangeAt(e.clientX, e.clientY);
+    const fragment = savedDragRange.extractContents();
+    savedDragRange = null;
+    if (dropRange && editor.contains(dropRange.commonAncestorContainer)) {
+      dropRange.insertNode(fragment);
+      // Place the cursor at the end of the moved content
+      dropRange.collapse(false);
+      const sel = window.getSelection();
+      if (sel) { sel.removeAllRanges(); sel.addRange(dropRange); }
+    }
+    hasUserEdited = true;
+    scheduleSync();
   }
 });
+
+// ── Image drag-to-reposition ──
+{
+  let draggedImg: HTMLImageElement | null = null;
+  let dragClone: HTMLElement | null = null;
+  let dropCaret: HTMLElement | null = null;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+  let isDraggingImg = false;
+
+  function updateDropCaret(x: number, y: number): void {
+    if (!dropCaret) return;
+    const range = getCaretRangeAt(x, y);
+    if (!range || !editor.contains(range.commonAncestorContainer)) {
+      dropCaret.style.display = 'none';
+      return;
+    }
+    const rects = range.getClientRects();
+    const rect = rects[0];
+    if (!rect) { dropCaret.style.display = 'none'; return; }
+    dropCaret.style.left = rect.left + 'px';
+    dropCaret.style.top = rect.top + 'px';
+    dropCaret.style.height = Math.max(rect.height, 16) + 'px';
+    dropCaret.style.display = 'block';
+  }
+
+  // Suppress the browser's built-in image drag; capture selection for text drag
+  editor.addEventListener('dragstart', (e: DragEvent) => {
+    if ((e.target as HTMLElement).tagName === 'IMG') {
+      e.preventDefault();
+      return;
+    }
+    // Capture the selection range so the drop handler can reinsert it manually
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && !sel.isCollapsed && editor.contains(sel.anchorNode)) {
+      savedDragRange = sel.getRangeAt(0).cloneRange();
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+    }
+  });
+
+  editor.addEventListener('mousedown', (e: MouseEvent) => {
+    if ((e.target as HTMLElement).tagName !== 'IMG' || e.button !== 0) return;
+    const img = e.target as HTMLImageElement;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const imgRect = img.getBoundingClientRect();
+    dragOffsetX = startX - imgRect.left;
+    dragOffsetY = startY - imgRect.top;
+
+    const onMouseMove = (me: MouseEvent) => {
+      if (!isDraggingImg) {
+        if (Math.abs(me.clientX - startX) < 5 && Math.abs(me.clientY - startY) < 5) return;
+        isDraggingImg = true;
+        draggedImg = img;
+
+        // Floating clone that follows the cursor
+        dragClone = document.createElement('div');
+        dragClone.style.cssText = [
+          `position:fixed`,
+          `left:${imgRect.left}px`,
+          `top:${imgRect.top}px`,
+          `width:${imgRect.width}px`,
+          `height:${imgRect.height}px`,
+          `pointer-events:none`,
+          `opacity:0.75`,
+          `z-index:9999`,
+          `border:2px dashed var(--vscode-focusBorder,#007fd4)`,
+          `border-radius:3px`,
+          `background:url("${img.src}") center/contain no-repeat`,
+          `box-shadow:0 4px 16px rgba(0,0,0,0.35)`,
+        ].join(';');
+        document.body.appendChild(dragClone);
+
+        // Thin caret line indicating the drop position
+        dropCaret = document.createElement('div');
+        dropCaret.style.cssText = [
+          `position:fixed`,
+          `width:2px`,
+          `height:20px`,
+          `background:var(--vscode-focusBorder,#007fd4)`,
+          `pointer-events:none`,
+          `z-index:10000`,
+          `border-radius:1px`,
+          `box-shadow:0 0 4px var(--vscode-focusBorder,#007fd4)`,
+          `display:none`,
+        ].join(';');
+        document.body.appendChild(dropCaret);
+
+        img.style.opacity = '0.3';
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = 'grabbing';
+      }
+
+      if (isDraggingImg && dragClone) {
+        dragClone.style.left = (me.clientX - dragOffsetX) + 'px';
+        dragClone.style.top = (me.clientY - dragOffsetY) + 'px';
+        updateDropCaret(me.clientX, me.clientY);
+      }
+    };
+
+    const onMouseUp = (me: MouseEvent) => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      if (dragClone) { dragClone.remove(); dragClone = null; }
+      if (dropCaret) { dropCaret.remove(); dropCaret = null; }
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+
+      if (isDraggingImg && draggedImg) {
+        // Temporarily hide the image so caretRangeFromPoint doesn't land on it
+        draggedImg.style.display = 'none';
+        const range = getCaretRangeAt(me.clientX, me.clientY);
+        draggedImg.style.display = '';
+        draggedImg.style.opacity = '';
+
+        if (range && editor.contains(range.commonAncestorContainer)) {
+          const imgNode = draggedImg;
+          imgNode.remove();
+          range.insertNode(imgNode);
+        }
+        hasUserEdited = true;
+        scheduleSync();
+      }
+
+      isDraggingImg = false;
+      draggedImg = null;
+    };
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+  });
+}
 
 // ── Input handling ──
 editor.addEventListener('input', () => {
@@ -1024,12 +1255,32 @@ sourceEditor.addEventListener('input', () => {
 });
 
 // ── Keyboard shortcuts ──
+let chordPending = false;
+let chordTimer: ReturnType<typeof setTimeout> | null = null;
+
 editor.addEventListener('keydown', (e: KeyboardEvent) => {
+  // Handle pending Ctrl+K chord sequences
+  if (chordPending) {
+    chordPending = false;
+    if (chordTimer) { clearTimeout(chordTimer); chordTimer = null; }
+    if (e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      vscode.postMessage({ type: 'executeVsCodeCommand', command: 'workbench.action.files.saveAll' });
+      return;
+    }
+  }
+
   if (e.ctrlKey || e.metaKey) {
     switch (e.key.toLowerCase()) {
-      case 'k':
+      case 'l':
         e.preventDefault();
         document.getElementById('linkBtn')!.click();
+        break;
+      case 'k':
+        // Start Ctrl+K chord — e.g. Ctrl+K, S = Save All
+        e.preventDefault();
+        chordPending = true;
+        chordTimer = setTimeout(() => { chordPending = false; }, 1500);
         break;
       case 's':
         // Let VS Code handle save
@@ -1713,6 +1964,34 @@ function showImageContextMenu(img: HTMLImageElement, x: number, y: number) {
   menu.className = 'context-menu';
   menu.style.left = x + 'px';
   menu.style.top = y + 'px';
+
+  // Copy image to clipboard
+  const copyItem = document.createElement('button');
+  copyItem.className = 'context-menu-item';
+  copyItem.textContent = 'Copy Image';
+  copyItem.addEventListener('click', () => {
+    removeContextMenu();
+    const canvas = document.createElement('canvas');
+    const w = img.naturalWidth || img.clientWidth || 300;
+    const h = img.naturalHeight || img.clientHeight || 300;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(img, 0, 0, w, h);
+      canvas.toBlob((blob) => {
+        if (blob) {
+          navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]).catch(() => {});
+        }
+      }, 'image/png');
+    }
+  });
+  menu.appendChild(copyItem);
+
+  // Divider after copy
+  const copyDivider = document.createElement('div');
+  copyDivider.className = 'context-menu-divider';
+  menu.appendChild(copyDivider);
 
   // Resize image (not available for SVGs - they don't have meaningful pixel dimensions)
   if (!isSvgImage(img)) {

@@ -11,7 +11,7 @@ export function activate(context: vscode.ExtensionContext) {
       'visualMarkdownEditor.editor',
       provider,
       {
-        webviewOptions: { retainContextWhenHidden: true },
+        webviewOptions: { retainContextWhenHidden: true, enableFindWidget: true },
         supportsMultipleEditorsPerDocument: false,
       }
     )

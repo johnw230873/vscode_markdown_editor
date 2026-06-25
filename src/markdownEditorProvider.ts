@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
+import { marked } from 'marked';
 
 export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
   constructor(private readonly context: vscode.ExtensionContext) {}
@@ -195,6 +197,21 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         case 'showInfo':
           vscode.window.showInformationMessage(message.text);
           return;
+
+        case 'executeVsCodeCommand': {
+          vscode.commands.executeCommand(message.command as string);
+          return;
+        }
+
+        case 'exportPdf': {
+          this.handleExportPdf(document, message.isDark ?? false);
+          return;
+        }
+
+        case 'exportDocx': {
+          this.handleExportDocx(document);
+          return;
+        }
       }
     });
 
@@ -309,6 +326,75 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     } catch (e) {
       vscode.window.showErrorMessage(`Failed to delete image: ${e}`);
     }
+  }
+
+  private async handleExportPdf(document: vscode.TextDocument, isDark: boolean): Promise<void> {
+    const outPath = document.uri.fsPath.replace(/\.(md|markdown|mdown)$/i, '.pdf');
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Exporting to PDF…' },
+      async () => {
+        try {
+          const docDir = path.dirname(document.uri.fsPath);
+          const html = buildExportHtml(document.getText(), docDir, '', isDark);
+          // Embed images as base64 so Puppeteer can render them without file:// access restrictions
+          const htmlWithImages = embedImagesAsBase64(html, docDir);
+          await renderHtmlToPdf(htmlWithImages, outPath);
+          const open = await vscode.window.showInformationMessage(
+            `PDF saved: ${path.basename(outPath)}`, 'Open'
+          );
+          if (open === 'Open') {
+            vscode.env.openExternal(vscode.Uri.file(outPath));
+          }
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`PDF export failed: ${e.message}`);
+        }
+      }
+    );
+  }
+
+  private async handleExportDocx(document: vscode.TextDocument): Promise<void> {
+    const outPath = document.uri.fsPath.replace(/\.(md|markdown|mdown)$/i, '.docx');
+
+    // ── Pre-flight validation ─────────────────────────────────────────────────
+    const issues = validateDocxCompatibility(document.getText());
+    if (issues.length > 0) {
+      const lines = [
+        'Word (.docx) export cannot proceed. The following issues must be fixed first:',
+        '',
+        ...issues.map(i => `  • ${i}`),
+        '',
+        'Tip: Right-click any SVG image in the editor and choose "Convert to PNG" to convert it.',
+      ];
+      vscode.window.showErrorMessage(lines.join('\n'), { modal: true });
+      return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Exporting to Word (.docx)…' },
+      async () => {
+        try {
+          const docDir = path.dirname(document.uri.fsPath);
+          const html = buildExportHtml(document.getText(), docDir, '', false);
+          const htmlWithEmbeddedImages = embedImagesAsBase64(html, docDir, true);
+          const HTMLtoDOCX = require('html-to-docx');
+          const buf: Buffer = await HTMLtoDOCX(htmlWithEmbeddedImages, null, {
+            table: { row: { cantSplit: true } },
+            footer: false,
+            pageNumber: false,
+          });
+          fs.writeFileSync(outPath, buf);
+          const open = await vscode.window.showInformationMessage(
+            `Word document saved: ${path.basename(outPath)}`, 'Open'
+          );
+          if (open === 'Open') {
+            vscode.env.openExternal(vscode.Uri.file(outPath));
+          }
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`DOCX export failed: ${e.message}`);
+        }
+      }
+    );
   }
 
   private async handleConvertSvgToPng(
@@ -577,7 +663,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       </div>
       <div class="toolbar-separator"></div>
       <div class="toolbar-group">
-        <button class="toolbar-btn" id="linkBtn" title="Insert Link (Ctrl+K)">&#x1F517; Link</button>
+        <button class="toolbar-btn" id="linkBtn" title="Insert Link (Ctrl+L)">&#x1F517; Link</button>
         <button class="toolbar-btn" id="imageBtn" title="Insert Image">&#x1F5BC; Image</button>
       </div>
       <div class="toolbar-separator"></div>
@@ -591,6 +677,11 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         <button class="toolbar-btn" id="blockquoteBtn" title="Blockquote">&#x275D;</button>
         <button class="toolbar-btn" id="hrBtn" title="Horizontal Rule">&#x2015;</button>
         <button class="toolbar-btn" id="tableBtn" title="Insert Table">&#x25A6; Table</button>
+      </div>
+      <div class="toolbar-separator"></div>
+      <div class="toolbar-group">
+        <button class="toolbar-btn" id="exportPdfBtn" title="Export to PDF">&#x2B73; PDF</button>
+        <button class="toolbar-btn" id="exportDocxBtn" title="Export to Word (.docx)">&#x2B73; DOCX</button>
       </div>
       <div class="toolbar-separator"></div>
       <div class="toolbar-group">
@@ -779,4 +870,172 @@ function findBrowserPath(): string | undefined {
       ];
 
   return candidates.find(p => p && fs.existsSync(p));
+}
+
+// ── Export helpers ────────────────────────────────────────────────────────────
+
+const DOCX_UNSUPPORTED_IMAGE_EXTS = new Set(['svg', 'webp', 'avif', 'tiff', 'tif']);
+
+/**
+ * Scans the markdown for content that cannot be exported to DOCX.
+ * Returns a list of human-readable issue descriptions, empty if all clear.
+ */
+function validateDocxCompatibility(markdown: string): string[] {
+  const issues: string[] = [];
+
+  // Find all image references: ![alt](path) and <img src="path">
+  const mdImageRegex = /!\[[^\]]*\]\(([^)]+)\)/g;
+  const htmlImageRegex = /<img[^>]+src="([^"]+)"/gi;
+
+  const checkImagePath = (src: string) => {
+    // Ignore external URLs and data URIs
+    if (/^https?:\/\//.test(src) || src.startsWith('data:')) return;
+    // Strip any sizing suffix like " =300x"
+    const cleanSrc = src.split(' ')[0];
+    const ext = path.extname(cleanSrc).toLowerCase().slice(1);
+    if (DOCX_UNSUPPORTED_IMAGE_EXTS.has(ext)) {
+      const fileName = path.basename(cleanSrc);
+      issues.push(
+        `"${fileName}" is a .${ext} image — Word does not support this format. ` +
+        `Convert it to PNG first (right-click the image → "Convert to PNG").`
+      );
+    }
+  };
+
+  let m: RegExpExecArray | null;
+  while ((m = mdImageRegex.exec(markdown)) !== null) checkImagePath(m[1]);
+  while ((m = htmlImageRegex.exec(markdown)) !== null) checkImagePath(m[1]);
+
+  // Deduplicate (same file referenced multiple times)
+  return [...new Set(issues)];
+}
+
+marked.setOptions({ gfm: true, breaks: true });
+
+/**
+ * Converts the markdown to a standalone HTML page suitable for PDF/DOCX export.
+ * Image src attributes are resolved to absolute file:// URIs.
+ */
+function buildExportHtml(markdown: string, docDir: string, extraCss: string, isDark: boolean): string {
+  const bgColor = isDark ? '#1e1e1e' : '#ffffff';
+  const fgColor = isDark ? '#d4d4d4' : '#1a1a1a';
+  const linkColor = isDark ? '#4ec9b0' : '#0070c1';
+
+  let html = marked.parse(markdown) as string;
+
+  // Resolve relative image paths to absolute file URIs
+  html = html.replace(
+    /<img\s([^>]*?)src="(?!https?:\/\/|data:|file:)([^"]+)"([^>]*?)>/gi,
+    (_match, before, src, after) => {
+      // Handle /.attachments/ prefix (one directory up)
+      let absPath: string;
+      if (src.startsWith('/.attachments/') || src.startsWith('/.attachments\\')) {
+        absPath = path.join(path.dirname(docDir), src.slice(1));
+      } else {
+        absPath = path.resolve(docDir, src);
+      }
+      const fileUri = `file:///${absPath.replace(/\\/g, '/')}`;
+      return `<img ${before}src="${fileUri}"${after}>`;
+    }
+  );
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+       font-size: 14px; line-height: 1.6; background: ${bgColor}; color: ${fgColor};
+       max-width: 860px; margin: 0 auto; padding: 40px 60px; }
+h1,h2,h3,h4,h5,h6 { margin-top: 1.4em; margin-bottom: 0.4em; font-weight: 600; }
+h1 { font-size: 2em; border-bottom: 1px solid ${isDark ? '#444' : '#ddd'}; padding-bottom: 0.2em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid ${isDark ? '#333' : '#eee'}; padding-bottom: 0.1em; }
+code { background: ${isDark ? '#2d2d2d' : '#f0f0f0'}; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+pre { background: ${isDark ? '#2d2d2d' : '#f6f8fa'}; padding: 12px 16px; border-radius: 6px; overflow: auto; }
+pre code { background: none; padding: 0; }
+blockquote { border-left: 4px solid ${isDark ? '#444' : '#ddd'}; margin: 0; padding: 0 16px; color: ${isDark ? '#999' : '#666'}; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid ${isDark ? '#444' : '#ccc'}; padding: 8px 12px; text-align: left; }
+th { background: ${isDark ? '#2d2d2d' : '#f0f0f0'}; font-weight: 600; }
+a { color: ${linkColor}; }
+img { max-width: 100%; height: auto; }
+hr { border: none; border-top: 1px solid ${isDark ? '#444' : '#ddd'}; margin: 1.5em 0; }
+${extraCss}
+</style>
+</head>
+<body>${html}</body>
+</html>`;
+}
+
+/**
+ * Replaces file:// image src attributes with base64 data URIs for embedding in DOCX.
+ */
+/**
+ * Embeds images as base64 data URIs.
+ * @param forDocx When true, SVG images are stripped (Word doesn't support SVG) and
+ *                any unresolvable image is removed rather than kept with a broken src.
+ */
+function embedImagesAsBase64(html: string, docDir: string, forDocx = false): string {
+  return html.replace(
+    /<img\s([^>]*?)src="(?!https?:\/\/|data:)([^"]+)"([^>]*?)>/gi,
+    (_match, before, src, after) => {
+      try {
+        let filePath: string;
+        if (src.startsWith('file:///')) {
+          filePath = decodeURIComponent(src.slice(8).replace(/\//g, path.sep));
+        } else if (src.startsWith('/.attachments/') || src.startsWith('/.attachments\\')) {
+          filePath = path.join(path.dirname(docDir), src.slice(1));
+        } else {
+          filePath = path.resolve(docDir, src);
+        }
+        if (!fs.existsSync(filePath)) {
+          return forDocx ? '' : _match; // remove broken images for DOCX, keep for PDF
+        }
+        const ext = path.extname(filePath).toLowerCase().slice(1);
+        if (forDocx && ext === 'svg') {
+          return ''; // Word doesn't support SVG — strip it
+        }
+        const mime = ext === 'jpg' ? 'jpeg' : ext === 'svg' ? 'svg+xml' : ext;
+        const b64 = fs.readFileSync(filePath).toString('base64');
+        return `<img ${before}src="data:image/${mime};base64,${b64}"${after}>`;
+      } catch {
+        return forDocx ? '' : _match;
+      }
+    }
+  );
+}
+
+async function renderHtmlToPdf(html: string, outPath: string): Promise<void> {
+  const puppeteer = require('puppeteer-core');
+  const browserPath = findBrowserPath();
+  if (!browserPath) {
+    throw new Error('Could not find Chrome or Edge. Install Google Chrome or Microsoft Edge to export PDF.');
+  }
+
+  const browser = await puppeteer.launch({
+    executablePath: browserPath,
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  // Write to a temp file so page.goto() is used instead of setContent().
+  // setContent() can hit Puppeteer's 30s navigation timeout with large base64 content;
+  // goto('file://...') with waitUntil:'load' is far more reliable.
+  const tmpFile = path.join(os.tmpdir(), `vme-pdf-${Date.now()}.html`);
+  fs.writeFileSync(tmpFile, html, 'utf8');
+
+  try {
+    const page = await browser.newPage();
+    const fileUrl = 'file:///' + tmpFile.replace(/\\/g, '/');
+    await page.goto(fileUrl, { waitUntil: 'load', timeout: 120000 });
+    await page.pdf({
+      path: outPath,
+      format: 'A4',
+      margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
+      printBackground: true,
+    });
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { /* ignore cleanup errors */ }
+    await browser.close();
+  }
 }
