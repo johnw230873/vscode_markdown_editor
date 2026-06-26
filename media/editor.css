@@ -656,6 +656,13 @@ body {
   text-decoration-skip-ink: none;
 }
 
+/* ── Raw-editor selection mirror highlight ── */
+::highlight(raw-selection) {
+  background-color: var(--vscode-editor-selectionHighlightBackground,
+                        var(--vscode-editor-selectionBackground,
+                            rgba(38, 79, 120, 0.4)));
+}
+
 /* ── Context Menu ── */
 .context-menu {
   position: fixed;

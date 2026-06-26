@@ -242,6 +242,10 @@ let hasUserEdited = false;
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let navUpdateTimer: ReturnType<typeof setTimeout> | null = null;
 
+// ── Scroll sync state ──
+let _isSyncingScroll = false;          // true while we are programmatically scrolling the editor
+let _scrollSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
 // ── Navigation Pane ──
 function toggleNav(show?: boolean) {
   isNavVisible = show !== undefined ? show : !isNavVisible;
@@ -329,7 +333,62 @@ editorContainer.addEventListener('wheel', (e: WheelEvent) => {
   }
 }, { passive: false });
 
+// ── Scroll sync: notify the extension when the user scrolls the visual editor ──
+editorContainer.addEventListener('scroll', () => {
+  if (_isSyncingScroll || isSourceView) return;
+  if (_scrollSyncTimer) clearTimeout(_scrollSyncTimer);
+  _scrollSyncTimer = setTimeout(() => {
+    // Find the topmost visible block element that carries a source-line annotation.
+    const containerTop = editorContainer.getBoundingClientRect().top;
+    const annotated = Array.from(
+      editor.querySelectorAll<HTMLElement>('[data-source-line]')
+    );
+    let bestLine = 0;
+    for (const el of annotated) {
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom > containerTop) {
+        bestLine = parseInt(el.getAttribute('data-source-line') || '0', 10);
+        break;
+      }
+    }
+    vscode.postMessage({ type: 'scrollSync', line: bestLine });
+  }, 80);
+});
+
 // ── Markdown ↔ HTML conversion ──
+
+/**
+ * Annotates each top-level block element in `html` with a `data-source-line`
+ * attribute whose value is the 0-based line number of the corresponding token
+ * in the original markdown. Used for scroll synchronisation with the linked
+ * plain-text editor.
+ */
+function injectSourceLines(html: string, tokens: any[]): string {
+  // Build an ordered list of start-line numbers, one per rendered block element.
+  // Tokens of type 'space' and 'def' produce no HTML output, so skip them.
+  const lineNums: number[] = [];
+  let lineNum = 0;
+  for (const token of tokens) {
+    if (token.type !== 'space' && token.type !== 'def') {
+      lineNums.push(lineNum);
+    }
+    lineNum += (token.raw || '').split('\n').length - 1;
+  }
+  if (lineNums.length === 0) return html;
+
+  // Use DOMParser to enumerate only the direct (top-level) child elements and
+  // stamp each one with its source line number.
+  const doc = new DOMParser().parseFromString('<div>' + html + '</div>', 'text/html');
+  const root = doc.body.firstElementChild as HTMLElement;
+  if (!root) return html;
+  Array.from(root.children).forEach((child, i) => {
+    if (i < lineNums.length) {
+      child.setAttribute('data-source-line', String(lineNums[i]));
+    }
+  });
+  return root.innerHTML;
+}
+
 function markdownToHtml(md: string): string {
   // Pre-process Azure DevOps image size syntax: ![alt](url =WIDTHx) or ![alt](url =WIDTHxHEIGHT)
   md = md.replace(
@@ -338,6 +397,8 @@ function markdownToHtml(md: string): string {
       return `<img src="${src.trim()}" alt="${alt}" width="${width}">`;
     }
   );
+  // Tokenise first so we can annotate rendered elements with source line numbers.
+  const mdTokens: any[] = (marked as any).lexer(md);
   let html = marked.parse(md) as string;
   // Intercept mermaid code blocks before any other processing.
   // marked renders them as <pre><code class="language-mermaid">…</code></pre>;
@@ -407,6 +468,8 @@ function markdownToHtml(md: string): string {
       return `<img ${cleanBefore}style="width: ${width}px; max-width: 100%; height: auto;"${cleanAfter}>`;
     }
   );
+  // Annotate top-level block elements with source line numbers for scroll sync.
+  html = injectSourceLines(html, mdTokens);
   return html;
 }
 
@@ -1338,6 +1401,8 @@ window.addEventListener('message', (event) => {
         editor.innerHTML = html;
         editor.scrollTop = scrollTop;
         renderMermaidDiagrams();
+        // Clear any stale raw-selection highlight (content just changed)
+        if ((CSS as any).highlights) { (CSS as any).highlights.delete('raw-selection'); }
       } else {
         sourceEditor.value = message.content;
       }
@@ -1355,6 +1420,42 @@ window.addEventListener('message', (event) => {
       const words: string[] = message.words || [];
       words.forEach((w: string) => dictionary.add(w));
       requestSpellCheck();
+      break;
+    }
+
+    case 'rawSelection': {
+      // Mirror the raw-editor text selection into the visual editor using a
+      // CSS Custom Highlight (no DOM events fired → no feedback loop).
+      if (!isSourceView) {
+        applyRawSelectionHighlight(
+          message.startLine as number,
+          message.endLine as number,
+          (message.selectedText as string) || '',
+        );
+      }
+      break;
+    }
+
+    case 'scrollToLine': {
+      if (isSourceView) break;
+      const targetLine = message.line as number;
+      const annotated = Array.from(
+        editor.querySelectorAll<HTMLElement>('[data-source-line]')
+      );
+      if (annotated.length === 0) break;
+      // Find the annotated element whose source line is closest to (but not past) targetLine.
+      let best = annotated[0];
+      for (const el of annotated) {
+        const ln = parseInt(el.getAttribute('data-source-line') || '0', 10);
+        if (ln <= targetLine) {
+          best = el;
+        } else {
+          break;
+        }
+      }
+      _isSyncingScroll = true;
+      best.scrollIntoView({ block: 'start' });
+      setTimeout(() => { _isSyncingScroll = false; }, 300);
       break;
     }
 
@@ -1557,6 +1658,106 @@ function runSpellCheck() {
   }
   currentMisspelled = misspelled;
   applySpellHighlights();
+}
+
+// ── Raw-editor → Visual selection highlight ──
+
+/** Strip common markdown inline/block syntax so we can match display text. */
+function stripInlineMarkdown(text: string): string {
+  return text
+    .replace(/^#+\s+/gm, '')
+    .replace(/^[-*+]\s+/gm, '')
+    .replace(/^\d+\.\s+/gm, '')
+    .replace(/^>\s*/gm, '')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/__([^_\n]+)__/g, '$1')
+    .replace(/_([^_\n]+)_/g, '$1')
+    .replace(/~~([^~\n]+)~~/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+    .trim();
+}
+
+/** Walk text nodes inside `editor` and return a Range matching `searchText`, or null. */
+function findTextRangeInEditor(searchText: string): Range | null {
+  const segments: Array<{ node: Text; nodeStart: number }> = [];
+  let fullText = '';
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    const t = (node as Text).textContent || '';
+    if (t.length > 0) {
+      segments.push({ node: node as Text, nodeStart: fullText.length });
+      fullText += t;
+    }
+  }
+  const idx = fullText.indexOf(searchText);
+  if (idx < 0) return null;
+  const endIdx = idx + searchText.length;
+  let startNode: Text | null = null, startOff = 0;
+  let endNode: Text | null = null, endOff = 0;
+  for (const seg of segments) {
+    const segEnd = seg.nodeStart + (seg.node.textContent?.length || 0);
+    if (!startNode && idx >= seg.nodeStart && idx < segEnd) {
+      startNode = seg.node;
+      startOff = idx - seg.nodeStart;
+    }
+    if (!endNode && endIdx > seg.nodeStart && endIdx <= segEnd) {
+      endNode = seg.node;
+      endOff = endIdx - seg.nodeStart;
+    }
+    if (startNode && endNode) break;
+  }
+  if (!startNode || !endNode) return null;
+  try {
+    const range = document.createRange();
+    range.setStart(startNode, startOff);
+    range.setEnd(endNode, endOff);
+    return range;
+  } catch { return null; }
+}
+
+/**
+ * Apply (or clear) the `raw-selection` CSS Custom Highlight.
+ * Tries an exact text match first; falls back to highlighting the
+ * block elements whose `data-source-line` falls in [startLine, endLine].
+ */
+function applyRawSelectionHighlight(startLine: number, endLine: number, rawText: string): void {
+  if (!(CSS as any).highlights) return;
+  (CSS as any).highlights.delete('raw-selection');
+  if (startLine < 0) return;
+
+  // Attempt precise match using stripped display text
+  const cleanText = stripInlineMarkdown(rawText);
+  if (cleanText.length >= 2) {
+    const range = findTextRangeInEditor(cleanText);
+    if (range) {
+      (CSS as any).highlights.set('raw-selection', new (window as any).Highlight(range));
+      // Scroll into view if outside the container
+      const rect = range.getBoundingClientRect();
+      const cRect = editorContainer.getBoundingClientRect();
+      if (rect.top < cRect.top || rect.bottom > cRect.bottom) {
+        (range.startContainer as Element).parentElement?.scrollIntoView({ block: 'nearest' });
+      }
+      return;
+    }
+  }
+
+  // Fallback: highlight every annotated block element in the selected line range
+  const ranges: Range[] = [];
+  editor.querySelectorAll<HTMLElement>('[data-source-line]').forEach(el => {
+    const line = parseInt(el.getAttribute('data-source-line') || '-1', 10);
+    if (line >= startLine && line <= endLine) {
+      const r = document.createRange();
+      r.selectNodeContents(el);
+      ranges.push(r);
+    }
+  });
+  if (ranges.length > 0) {
+    (CSS as any).highlights.set('raw-selection', new (window as any).Highlight(...ranges));
+  }
 }
 
 function applySpellHighlights() {

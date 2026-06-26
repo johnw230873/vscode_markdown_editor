@@ -67,6 +67,13 @@
           "when": "resourceExtname == .svg",
           "group": "navigation"
         }
+      ],
+      "editor/title/context": [
+        {
+          "command": "visualMarkdownEditor.openVisualEditor",
+          "when": "resourceExtname == .md || resourceExtname == .markdown",
+          "group": "navigation"
+        }
       ]
     }
   },

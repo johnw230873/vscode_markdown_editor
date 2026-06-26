@@ -94,6 +94,12 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     };
 
     let isWebviewEdit = false;
+    // True while we are programmatically revealing a line in the linked editor
+    // (so we don't echo the change back to the webview as another scrollToLine).
+    let isSyncingFromWebview = false;
+    // True while we are applying a Visual→Raw selection so the Raw→Visual
+    // listener doesn’t echo it straight back.
+    let isSyncingSelectionFromVisual = false;
 
     const updateWebview = () => {
       webviewPanel.webview.postMessage({
@@ -151,7 +157,11 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
                 Math.max(0, Math.min(message.endOffset as number, document.getText().length))
               );
               const sel = new vscode.Selection(startPos, endPos);
+              // Guard: suppress the Raw→Visual echo that would be triggered by
+              // the onDidChangeTextEditorSelection fired by setting linked.selection.
+              isSyncingSelectionFromVisual = true;
               linked.selection = sel;
+              setTimeout(() => { isSyncingSelectionFromVisual = false; }, 400);
               if (!sel.isEmpty) {
                 linked.revealRange(sel, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
               }
@@ -164,6 +174,19 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 
         case 'insertImage': {
           this.handleInsertImage(document, webviewPanel);
+          return;
+        }
+
+        case 'scrollSync': {
+          // Scroll the linked plain-text editor to match the visual editor position.
+          const linked = MarkdownEditorProvider.getLinkedEditor(document.uri.toString());
+          if (linked) {
+            isSyncingFromWebview = true;
+            const line = Math.max(0, Math.min(message.line as number, document.lineCount - 1));
+            const pos = new vscode.Position(line, 0);
+            linked.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.AtTop);
+            setTimeout(() => { isSyncingFromWebview = false; }, 300);
+          }
           return;
         }
 
@@ -223,6 +246,35 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       }
     });
 
+    // Mirror raw-editor text selections into the visual editor.
+    const uriString = document.uri.toString();
+    const selectionSubscription = vscode.window.onDidChangeTextEditorSelection((e) => {
+      if (e.textEditor.document.uri.toString() !== uriString) return;
+      if (isSyncingSelectionFromVisual) return;  // don't echo Visual→Raw change back
+      if (isSyncingFromWebview) return;           // don't trigger during scroll reveal
+      const sel = e.selections[0];
+      if (!sel) return;
+      if (sel.isEmpty) {
+        webviewPanel.webview.postMessage({ type: 'rawSelection', startLine: -1, endLine: -1, selectedText: '' });
+        return;
+      }
+      webviewPanel.webview.postMessage({
+        type: 'rawSelection',
+        startLine: sel.start.line,
+        endLine: sel.end.line,
+        selectedText: document.getText(sel),
+      });
+    });
+
+    // Scroll the visual editor when the user scrolls the linked plain-text editor.
+    const visibleRangesSubscription = vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
+      if (isSyncingFromWebview) return;
+      if (e.textEditor.document.uri.toString() !== uriString) return;
+      if (e.visibleRanges.length === 0) return;
+      const firstLine = e.visibleRanges[0].start.line;
+      webviewPanel.webview.postMessage({ type: 'scrollToLine', line: firstLine });
+    });
+
     webviewPanel.onDidChangeViewState(() => {
       if (webviewPanel.active) {
         MarkdownEditorProvider.activeDocument = document;
@@ -233,6 +285,8 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     });
 
     webviewPanel.onDidDispose(() => {
+      selectionSubscription.dispose();
+      visibleRangesSubscription.dispose();
       changeDocumentSubscription.dispose();
       MarkdownEditorProvider.linkedEditors.delete(document.uri.toString());
       if (MarkdownEditorProvider.activeDocument === document) {
