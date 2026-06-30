@@ -19,6 +19,32 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     new vscode.EventEmitter<vscode.TextDocument | undefined>();
 
   /**
+   * Toggles the linked plain-text editor: opens it if not visible, closes it if already open.
+   */
+  static async toggleLinkedTextEditor(document: vscode.TextDocument): Promise<boolean> {
+    const uriKey = document.uri.toString();
+    const existing = MarkdownEditorProvider.getLinkedEditor(uriKey);
+    if (existing) {
+      // Close every tab showing this document as a plain-text editor.
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          if (
+            tab.input instanceof vscode.TabInputText &&
+            tab.input.uri.toString() === uriKey
+          ) {
+            await vscode.window.tabGroups.close(tab);
+          }
+        }
+      }
+      MarkdownEditorProvider.linkedEditors.delete(uriKey);
+      return false;
+    } else {
+      await MarkdownEditorProvider.openLinkedTextEditor(document);
+      return true;
+    }
+  }
+
+  /**
    * Opens the markdown source file as a standard text editor beside the visual editor.
    * Copilot agents read from this text editor for document content and selection context.
    */
@@ -118,6 +144,11 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
           // Send saved custom words to webview
           const customWords = this.context.globalState.get<string[]>('customDictionaryWords', []);
           webviewPanel.webview.postMessage({ type: 'loadCustomWords', words: customWords });
+          // Send initial Raw button state
+          webviewPanel.webview.postMessage({
+            type: 'linkedEditorState',
+            open: !!MarkdownEditorProvider.getLinkedEditor(document.uri.toString()),
+          });
           return;
 
         case 'addCustomWord': {
@@ -191,7 +222,9 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         }
 
         case 'openLinkedTextEditor': {
-          MarkdownEditorProvider.openLinkedTextEditor(document);
+          void MarkdownEditorProvider.toggleLinkedTextEditor(document).then((isOpen) => {
+            webviewPanel.webview.postMessage({ type: 'linkedEditorState', open: isOpen });
+          });
           return;
         }
 
@@ -739,7 +772,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
       </div>
       <div class="toolbar-separator"></div>
       <div class="toolbar-group">
-        <button class="toolbar-btn" id="copilotContextBtn" title="Open linked text editor so GitHub Copilot agents can see this document and your selection">&#x1F4CB; Copilot</button>
+        <button class="toolbar-btn" id="copilotContextBtn" title="Toggle Open/Close Raw text editor so GitHub Copilot can see this document and selection">&#x1F4CB; Raw</button>
       </div>
     </div>
   </div>
@@ -824,16 +857,11 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     </div>
   </div>
 
-  <div id="sourceContainer" style="display:none;">
-    <textarea id="sourceEditor" spellcheck="false"></textarea>
-  </div>
-
   <div id="statusBar">
     <span id="wordCount">Words: 0</span>
     <span id="charCount">Characters: 0</span>
     <span id="cursorPosition"></span>
     <span class="status-spacer"></span>
-    <button class="status-btn" id="toggleSourceBtn" title="Toggle Source View">&#x2328; Source</button>
     <button class="status-btn" id="toggleNavBtn" title="Toggle Outline">&#x2630; Outline</button>
     <button class="status-btn" id="togglePageModeBtn" title="Toggle Page Mode">&#x1F4C4; Page</button>
     <span class="status-separator"></span>

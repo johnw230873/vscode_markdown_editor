@@ -227,15 +227,12 @@ turndownService.addRule('sizedImage', {
 
 // ── DOM Elements ──
 const editor = document.getElementById('editor')!;
-const sourceEditor = document.getElementById('sourceEditor') as HTMLTextAreaElement;
 const editorContainer = document.getElementById('editorContainer')!;
-const sourceContainer = document.getElementById('sourceContainer')!;
 const wordCountEl = document.getElementById('wordCount')!;
 const charCountEl = document.getElementById('charCount')!;
 const navPane = document.getElementById('navPane')!;
 const navList = document.getElementById('navList')!;
 
-let isSourceView = false;
 let isUpdatingFromExtension = false;
 let isNavVisible = false;
 let hasUserEdited = false;
@@ -335,7 +332,7 @@ editorContainer.addEventListener('wheel', (e: WheelEvent) => {
 
 // ── Scroll sync: notify the extension when the user scrolls the visual editor ──
 editorContainer.addEventListener('scroll', () => {
-  if (_isSyncingScroll || isSourceView) return;
+  if (_isSyncingScroll) return;
   if (_scrollSyncTimer) clearTimeout(_scrollSyncTimer);
   _scrollSyncTimer = setTimeout(() => {
     // Find the topmost visible block element that carries a source-line annotation.
@@ -504,9 +501,7 @@ function scheduleSync() {
   if (!hasUserEdited) return;
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
-    const md = isSourceView
-      ? sourceEditor.value
-      : htmlToMarkdown(editor.innerHTML);
+    const md = htmlToMarkdown(editor.innerHTML);
     vscode.postMessage({ type: 'edit', content: md });
     updateWordCount(md);
   }, 500);
@@ -806,7 +801,7 @@ document.getElementById('mermaidBtn')!.addEventListener('click', () => {
   const html =
     `<div class="mermaid-diagram" data-code="${encoded}" contenteditable="false"></div>` +
     `<p><em style="color:var(--vscode-descriptionForeground,#888);font-size:0.85em;">` +
-    `Switch to Source view (&#9000; Source) to edit this diagram.</em></p><p><br></p>`;
+    `Switch to Copilot mode to edit this diagram.</em></p><p><br></p>`;
   editor.focus();
   document.execCommand('insertHTML', false, html);
   hasUserEdited = true;
@@ -995,30 +990,6 @@ function getSourceCharOffsetForCursor(md: string): number {
   // Convert line number to character offset in the markdown string
   return mdLines.slice(0, clamped).join('\n').length + (clamped > 0 ? 1 : 0);
 }
-
-// Toggle source view
-const editorWrapper = document.getElementById('editorWrapper')!;
-document.getElementById('toggleSourceBtn')!.addEventListener('click', () => {
-  isSourceView = !isSourceView;
-  document.getElementById('toggleSourceBtn')!.classList.toggle('active', isSourceView);
-  if (isSourceView) {
-    const md = htmlToMarkdown(editor.innerHTML);
-    const charOffset = getSourceCharOffsetForCursor(md);
-    sourceEditor.value = md;
-    editorWrapper.style.display = 'none';
-    sourceContainer.style.display = 'flex';
-    sourceEditor.focus();
-    sourceEditor.setSelectionRange(charOffset, charOffset);
-  } else {
-    const md = sourceEditor.value;
-    editor.innerHTML = markdownToHtml(md);
-    sourceContainer.style.display = 'none';
-    editorWrapper.style.display = 'flex';
-    editor.focus();
-    renderMermaidDiagrams();
-    scheduleNavRefresh();
-  }
-});
 
 // ── Copy with embedded images (for paste into Word / external apps) ──
 // When the selection contains images, intercept copy and replace each webview-resource
@@ -1312,11 +1283,6 @@ editor.addEventListener('input', () => {
   scheduleNavRefresh();
 });
 
-sourceEditor.addEventListener('input', () => {
-  hasUserEdited = true;
-  scheduleSync();
-});
-
 // ── Keyboard shortcuts ──
 let chordPending = false;
 let chordTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1395,17 +1361,13 @@ window.addEventListener('message', (event) => {
     case 'update': {
       isUpdatingFromExtension = true;
       const html = markdownToHtml(message.content);
-      if (!isSourceView) {
-        // Preserve scroll position
-        const scrollTop = editor.scrollTop;
-        editor.innerHTML = html;
-        editor.scrollTop = scrollTop;
-        renderMermaidDiagrams();
-        // Clear any stale raw-selection highlight (content just changed)
-        if ((CSS as any).highlights) { (CSS as any).highlights.delete('raw-selection'); }
-      } else {
-        sourceEditor.value = message.content;
-      }
+      // Preserve scroll position
+      const scrollTop = editor.scrollTop;
+      editor.innerHTML = html;
+      editor.scrollTop = scrollTop;
+      renderMermaidDiagrams();
+      // Clear any stale raw-selection highlight (content just changed)
+      if ((CSS as any).highlights) { (CSS as any).highlights.delete('raw-selection'); }
       updateWordCount(message.content);
       // Keep flag true briefly to catch async input events from innerHTML
       setTimeout(() => {
@@ -1426,18 +1388,15 @@ window.addEventListener('message', (event) => {
     case 'rawSelection': {
       // Mirror the raw-editor text selection into the visual editor using a
       // CSS Custom Highlight (no DOM events fired → no feedback loop).
-      if (!isSourceView) {
-        applyRawSelectionHighlight(
+      applyRawSelectionHighlight(
           message.startLine as number,
           message.endLine as number,
           (message.selectedText as string) || '',
         );
-      }
       break;
     }
 
     case 'scrollToLine': {
-      if (isSourceView) break;
       const targetLine = message.line as number;
       const annotated = Array.from(
         editor.querySelectorAll<HTMLElement>('[data-source-line]')
@@ -1461,16 +1420,7 @@ window.addEventListener('message', (event) => {
 
     case 'imageInserted': {
       const imgHtml = `<img src="${escapeHtml(message.src)}" alt="${escapeHtml(message.alt)}" style="max-width: 100%;">`;
-      if (!isSourceView) {
-        execCmd('insertHTML', imgHtml + '<p><br></p>');
-      } else {
-        const mdImage = `![${message.alt}](${message.markdownPath})`;
-        const pos = sourceEditor.selectionStart;
-        const before = sourceEditor.value.substring(0, pos);
-        const after = sourceEditor.value.substring(pos);
-        sourceEditor.value = before + mdImage + after;
-        scheduleSync();
-      }
+      execCmd('insertHTML', imgHtml + '<p><br></p>');
       break;
     }
 
@@ -1482,8 +1432,7 @@ window.addEventListener('message', (event) => {
       const width = message.width as number;
       const height = message.height as number;
 
-      if (!isSourceView) {
-        const imgs = editor.querySelectorAll('img');
+      const imgs = editor.querySelectorAll('img');
         for (const img of imgs) {
           if (img.getAttribute('src') === oldSrc) {
             img.setAttribute('src', newSrc);
@@ -1496,15 +1445,12 @@ window.addEventListener('message', (event) => {
         }
         hasUserEdited = true;
         scheduleSync();
-      } else {
-        // In source mode, replace the markdown image reference
-        const oldRelativePath = message.oldRelativePath as string;
-        sourceEditor.value = sourceEditor.value.replace(
-          new RegExp(`!\\[([^\\]]*)\\]\\(${oldRelativePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`),
-          `![$1](${newMarkdownPath})`
-        );
-        scheduleSync();
-      }
+      break;
+    }
+
+    case 'linkedEditorState': {
+      document.getElementById('copilotContextBtn')!
+        .classList.toggle('active', message.open as boolean);
       break;
     }
   }
@@ -1556,18 +1502,6 @@ function reportSelection() {
   // Do NOT send anything while the webview is unfocused — preserve the last
   // known selection in the linked text editor so Copilot can still read it.
   if (!webviewHasFocus) return;
-
-  if (isSourceView) {
-    const start = sourceEditor.selectionStart;
-    const end = sourceEditor.selectionEnd;
-    vscode.postMessage({
-      type: 'selectionChange',
-      startOffset: start,
-      endOffset: end,
-      selectedText: sourceEditor.value.substring(start, end),
-    });
-    return;
-  }
 
   const sel = window.getSelection();
   if (!sel || !sel.rangeCount || !editor.contains(sel.focusNode)) {
@@ -1640,7 +1574,6 @@ let spellCheckTimer: ReturnType<typeof setTimeout> | null = null;
 let currentMisspelled: Set<string> = new Set();
 
 function requestSpellCheck() {
-  if (isSourceView) return;
   if (spellCheckTimer) clearTimeout(spellCheckTimer);
   spellCheckTimer = setTimeout(runSpellCheck, 300);
 }
@@ -2442,7 +2375,6 @@ document.addEventListener('keydown', (e) => {
 
 // ── Cursor position tracking ──
 document.addEventListener('selectionchange', () => {
-  if (isSourceView) return;
   const cursorEl = document.getElementById('cursorPosition');
   if (!cursorEl) return;
   const sel = window.getSelection();

@@ -866,6 +866,7 @@ body {
 .status-btn.active {
   opacity: 1;
   font-weight: 600;
+  background: var(--toolbar-btn-active);
 }
 
 #statusBar .zoom-label {

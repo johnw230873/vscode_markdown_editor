@@ -64,7 +64,7 @@ export function activate(context: vscode.ExtensionContext) {
   // GitHub Copilot see the document content and your current selection.
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
   statusBar.command = 'visualMarkdownEditor.openLinkedTextEditor';
-  statusBar.tooltip = 'Open linked text editor so GitHub Copilot can see this document and selection';
+  statusBar.tooltip = 'Toggle Open/Close Raw text editor so GitHub Copilot can see this document and selection';
   context.subscriptions.push(statusBar);
 
   function updateStatusBar(doc: vscode.TextDocument | undefined) {
