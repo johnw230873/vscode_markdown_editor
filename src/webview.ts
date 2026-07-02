@@ -1,7 +1,6 @@
 import { marked } from 'marked';
 import TurndownService from 'turndown';
 import { gfm } from 'turndown-plugin-gfm';
-import words from 'an-array-of-english-words';
 import mermaid from 'mermaid';
 
 declare function acquireVsCodeApi(): {
@@ -13,9 +12,26 @@ declare function acquireVsCodeApi(): {
 const vscode = acquireVsCodeApi();
 
 // ── Spell Check Dictionary (client-side) ──
-const dictionary = new Set(words);
+// Seeded with common tech/abbreviation words immediately; the full English word
+// list is fetched asynchronously from a local resource so it doesn't block the
+// initial script parse.
+const dictionary = new Set<string>();
 ['i', 'a', 'vs', 'ok', 'eg', 'ie', 'etc', 'url', 'html', 'css', 'js', 'ts',
  'api', 'ui', 'id', 'pdf', 'http', 'https', 'www', 'dev', 'src', 'img'].forEach(w => dictionary.add(w));
+
+// Load the full word list in the background.
+(async () => {
+  try {
+    const wordsUri = (window as any).__wordsUri as string | undefined;
+    if (wordsUri) {
+      const resp = await fetch(wordsUri);
+      const wordList: string[] = await resp.json();
+      wordList.forEach(w => dictionary.add(w));
+    }
+  } catch {
+    // Spell check will work with the seed words only.
+  }
+})();
 
 function checkWord(word: string): boolean {
   if (word.length < 2) return true;
@@ -847,12 +863,6 @@ document.getElementById('hrBtn')!.addEventListener('click', () => {
   execCmd('insertHTML', '<hr><p><br></p>');
 });
 
-// Copilot context button — opens the linked plain-text editor so GitHub
-// Copilot agents can see this document and the current selection.
-document.getElementById('copilotContextBtn')!.addEventListener('click', () => {
-  vscode.postMessage({ type: 'openLinkedTextEditor' });
-});
-
 // Export buttons
 document.getElementById('exportPdfBtn')!.addEventListener('click', () => {
   vscode.postMessage({ type: 'exportPdf', isDark: false });
@@ -1445,12 +1455,6 @@ window.addEventListener('message', (event) => {
         }
         hasUserEdited = true;
         scheduleSync();
-      break;
-    }
-
-    case 'linkedEditorState': {
-      document.getElementById('copilotContextBtn')!
-        .classList.toggle('active', message.open as boolean);
       break;
     }
   }
@@ -2401,6 +2405,40 @@ document.body.appendChild(imgTooltip);
 let imgTooltipTimer: ReturnType<typeof setTimeout> | null = null;
 let tooltipImg: HTMLImageElement | null = null;
 
+// ── Link hover tooltip ──
+const linkTooltip = document.createElement('div');
+linkTooltip.className = 'link-tooltip';
+const linkTooltipUrl = document.createElement('span');
+linkTooltipUrl.className = 'link-tooltip-url';
+const linkTooltipHint = document.createElement('span');
+linkTooltipHint.className = 'link-tooltip-hint';
+linkTooltipHint.textContent = 'Ctrl+Click to follow link';
+linkTooltip.appendChild(linkTooltipUrl);
+linkTooltip.appendChild(linkTooltipHint);
+document.body.appendChild(linkTooltip);
+
+let linkTooltipTimer: ReturnType<typeof setTimeout> | null = null;
+let tooltipAnchor: HTMLAnchorElement | null = null;
+
+function showLinkTooltip(anchor: HTMLAnchorElement, x: number, y: number) {
+  linkTooltipUrl.textContent = anchor.getAttribute('href') || '';
+  linkTooltip.style.display = 'block';
+  const offset = 14;
+  linkTooltip.style.left = (x + offset) + 'px';
+  linkTooltip.style.top  = (y + offset) + 'px';
+  requestAnimationFrame(() => {
+    const rect = linkTooltip.getBoundingClientRect();
+    if (rect.right  > window.innerWidth  - 8) linkTooltip.style.left = (x - rect.width  - offset) + 'px';
+    if (rect.bottom > window.innerHeight - 8) linkTooltip.style.top  = (y - rect.height - offset) + 'px';
+  });
+}
+
+function hideLinkTooltip() {
+  linkTooltip.style.display = 'none';
+  if (linkTooltipTimer) { clearTimeout(linkTooltipTimer); linkTooltipTimer = null; }
+  tooltipAnchor = null;
+}
+
 function showImgTooltip(img: HTMLImageElement, x: number, y: number) {
   const relativePath = getImageRelativePath(img);
   const filename = relativePath.replace(/\\/g, '/').split('/').pop() || relativePath;
@@ -2439,13 +2477,42 @@ editor.addEventListener('mousemove', (e: MouseEvent) => {
     const cx = e.clientX;
     const cy = e.clientY;
     imgTooltipTimer = setTimeout(() => showImgTooltip(img, cx, cy), 700);
+    // Hide link tooltip when over an image
+    if (tooltipAnchor) hideLinkTooltip();
   } else {
     if (tooltipImg) hideImgTooltip();
+    // Link tooltip
+    const anchor = (target as HTMLElement).closest('a') as HTMLAnchorElement | null;
+    if (anchor && anchor.getAttribute('href')) {
+      if (tooltipAnchor !== anchor) {
+        hideLinkTooltip();
+        tooltipAnchor = anchor;
+      }
+      if (linkTooltipTimer) clearTimeout(linkTooltipTimer);
+      const cx = e.clientX;
+      const cy = e.clientY;
+      linkTooltipTimer = setTimeout(() => showLinkTooltip(anchor, cx, cy), 500);
+    } else {
+      if (tooltipAnchor) hideLinkTooltip();
+    }
   }
 });
 
 editor.addEventListener('mouseleave', () => {
   hideImgTooltip();
+  hideLinkTooltip();
+});
+
+// ── Ctrl+Click on links to open files ──
+editor.addEventListener('click', (e: MouseEvent) => {
+  if (!e.ctrlKey && !e.metaKey) return;
+  const target = (e.target as HTMLElement).closest('a');
+  if (!target) return;
+  const href = target.getAttribute('href');
+  if (!href || href.startsWith('http://') || href.startsWith('https://') || href.startsWith('#')) return;
+  e.preventDefault();
+  e.stopPropagation();
+  vscode.postMessage({ type: 'openFile', href });
 });
 
 // ── Notify extension we're ready ──

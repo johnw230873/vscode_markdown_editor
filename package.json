@@ -2,7 +2,7 @@
   "name": "visual-markdown-editor",
   "displayName": "Visual Markdown Editor",
   "description": "A feature-rich WYSIWYG markdown editor for VS Code with image management, formatting, colors, and tables",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "publisher": "local",
   "engines": {
     "vscode": "^1.80.0"
@@ -53,6 +53,21 @@
       {
         "command": "visualMarkdownEditor.convertSvgToPng",
         "title": "Convert to PNG"
+      },
+      {
+        "command": "visualMarkdownEditor.showPreview",
+        "title": "Open Visual Markdown Preview",
+        "icon": "$(markdown)"
+      },
+      {
+        "command": "visualMarkdownEditor.showPreviewToSide",
+        "title": "Open Visual Markdown Preview to the Side",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "visualMarkdownEditor.openSource",
+        "title": "Open Source",
+        "icon": "$(go-to-file)"
       }
     ],
     "menus": {
@@ -65,6 +80,23 @@
         {
           "command": "visualMarkdownEditor.convertSvgToPng",
           "when": "resourceExtname == .svg",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "visualMarkdownEditor.showPreviewToSide",
+          "when": "editorLangId == markdown && activeCustomEditorId != 'visualMarkdownEditor.editor'",
+          "group": "navigation"
+        },
+        {
+          "command": "visualMarkdownEditor.showPreview",
+          "when": "editorLangId == markdown && activeCustomEditorId != 'visualMarkdownEditor.editor'",
+          "group": "navigation"
+        },
+        {
+          "command": "visualMarkdownEditor.openSource",
+          "when": "activeCustomEditorId == 'visualMarkdownEditor.editor'",
           "group": "navigation"
         }
       ],

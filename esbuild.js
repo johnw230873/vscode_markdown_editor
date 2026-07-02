@@ -21,7 +21,8 @@ const webviewConfig = {
   format: 'iife',
   platform: 'browser',
   target: 'es2020',
-  sourcemap: true,
+  minify: true,
+  sourcemap: false,
 };
 
 async function main() {

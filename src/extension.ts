@@ -31,6 +31,69 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // ── Preview icon buttons (like built-in markdown preview) ──────────────────
+  // Opens the visual editor in the current panel (replaces text editor).
+  context.subscriptions.push(
+    vscode.commands.registerCommand('visualMarkdownEditor.showPreview', async (uri?: vscode.Uri) => {
+      if (!uri) {
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor && activeEditor.document.languageId === 'markdown') {
+          uri = activeEditor.document.uri;
+        }
+      }
+      if (uri) {
+        await vscode.commands.executeCommand('vscode.openWith', uri, 'visualMarkdownEditor.editor', vscode.ViewColumn.Active);
+      }
+    })
+  );
+
+  // Opens the visual editor beside the current text editor (split view).
+  context.subscriptions.push(
+    vscode.commands.registerCommand('visualMarkdownEditor.showPreviewToSide', async (uri?: vscode.Uri) => {
+      if (!uri) {
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor && activeEditor.document.languageId === 'markdown') {
+          uri = activeEditor.document.uri;
+        }
+      }
+      if (uri) {
+        await vscode.commands.executeCommand('vscode.openWith', uri, 'visualMarkdownEditor.editor', vscode.ViewColumn.Beside);
+      }
+    })
+  );
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // ── Open Source (tab-bar icon when visual editor is active) ─────────────────
+  // Mirrors VS Code's built-in markdown "Open source" button: if the source file
+  // is already open as a text editor, focus it; otherwise open it in the same
+  // column as the visual editor (replacing it).
+  context.subscriptions.push(
+    vscode.commands.registerCommand('visualMarkdownEditor.openSource', async () => {
+      const doc = MarkdownEditorProvider.activeDocument;
+      if (!doc) return;
+
+      // Prefer an already-visible text editor for this document
+      const existing = vscode.window.visibleTextEditors.find(
+        e => e.document.uri.toString() === doc.uri.toString()
+      );
+      if (existing) {
+        await vscode.window.showTextDocument(existing.document, {
+          viewColumn: existing.viewColumn,
+          preserveFocus: false,
+          preview: false,
+        });
+        return;
+      }
+
+      // No text editor open yet — open in the same column as the visual editor
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.Active,
+        preview: false,
+      });
+    })
+  );
+  // ────────────────────────────────────────────────────────────────────────────
+
   context.subscriptions.push(
     vscode.commands.registerCommand('visualMarkdownEditor.newDocument', async () => {
       const workspaceFolders = vscode.workspace.workspaceFolders;

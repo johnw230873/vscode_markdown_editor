@@ -21,6 +21,39 @@
   opacity: 0.95;
 }
 
+/* ── Link hover tooltip ── */
+.link-tooltip {
+  display: none;
+  position: fixed;
+  z-index: 9999;
+  background: var(--vscode-editorHoverWidget-background, #252526);
+  color: var(--vscode-editorHoverWidget-foreground, #cccccc);
+  border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: var(--vscode-editor-font-family, 'Consolas', 'Courier New', monospace);
+  pointer-events: none;
+  max-width: 500px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  opacity: 0.95;
+  line-height: 1.5;
+}
+
+.link-tooltip-url {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.link-tooltip-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground, #999);
+  margin-top: 1px;
+}
+
 :root {
   --toolbar-bg: var(--vscode-editor-background, #1e1e1e);
   --toolbar-border: var(--vscode-panel-border, #444);

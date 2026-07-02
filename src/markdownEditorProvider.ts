@@ -268,6 +268,11 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
           this.handleExportDocx(document);
           return;
         }
+
+        case 'openFile': {
+          void this.handleOpenFile(document, message.href as string);
+          return;
+        }
       }
     });
 
@@ -437,6 +442,31 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         }
       }
     );
+  }
+
+  private async handleOpenFile(document: vscode.TextDocument, href: string): Promise<void> {
+    const docDir = path.dirname(document.uri.fsPath);
+    // Decode any URL encoding in the href
+    const decoded = decodeURIComponent(href);
+    const resolved = path.resolve(docDir, decoded);
+
+    // Try the path as-is first, then with common markdown extensions
+    const candidates = [resolved, `${resolved}.md`, `${resolved}.markdown`, `${resolved}.mdown`];
+    let found: string | undefined;
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        found = candidate;
+        break;
+      }
+    }
+
+    if (!found) {
+      vscode.window.showWarningMessage(`Cannot find file: ${decoded}`);
+      return;
+    }
+
+    const uri = vscode.Uri.file(found);
+    await vscode.commands.executeCommand('vscode.openWith', uri, 'visualMarkdownEditor.editor');
   }
 
   private async handleExportDocx(document: vscode.TextDocument): Promise<void> {
@@ -639,6 +669,9 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'media', 'editor.css')
     );
+    const wordsUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'words.json')
+    );
 
     const docDir = path.dirname(document.uri.fsPath);
     const baseUri = webview.asWebviewUri(vscode.Uri.file(docDir));
@@ -652,7 +685,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data: blob:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval'; font-src ${webview.cspSource};">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data: blob:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval'; font-src ${webview.cspSource}; connect-src ${webview.cspSource};">
   <link href="${styleUri}" rel="stylesheet">
   <title>Visual Markdown Editor</title>
 </head>
@@ -770,10 +803,6 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
         <button class="toolbar-btn" id="exportPdfBtn" title="Export to PDF">&#x2B73; PDF</button>
         <button class="toolbar-btn" id="exportDocxBtn" title="Export to Word (.docx)">&#x2B73; DOCX</button>
       </div>
-      <div class="toolbar-separator"></div>
-      <div class="toolbar-group">
-        <button class="toolbar-btn" id="copilotContextBtn" title="Toggle Open/Close Raw text editor so GitHub Copilot can see this document and selection">&#x1F4CB; Raw</button>
-      </div>
     </div>
   </div>
 
@@ -873,6 +902,7 @@ export class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
   <script nonce="${nonce}">
     window.__baseUri = "${baseUri}";
     window.__attachmentsBaseUri = "${attachmentsBaseUri}";
+    window.__wordsUri = "${wordsUri}";
   </script>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
